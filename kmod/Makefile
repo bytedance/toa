@@ -1,14 +1,19 @@
 
 
+MULTI_HOOK_DIR := /usr/src/multi-hook-dkms-1.0.0
+
+
+KBUILD_MODPOST_WARN=1
+
 
 obj-m	+= toa.o
+CFLAGS_toa.o := -DDEBUG -DTOA_USE_MULTI_HOOK -I$(MULTI_HOOK_DIR)
 
-CFLAGS_toa.o := -DDEBUG
 
 ifeq ($(KERNDIR), )
-KDIR	:= /lib/modules/$(shell uname -r)/build
+    KDIR	:= /lib/modules/$(shell uname -r)/build
 else
-KDIR	:= $(KERNDIR)
+    KDIR	:= $(KERNDIR)
 endif
 PWD	:= $(shell pwd)
 
@@ -18,23 +23,19 @@ PWD	:= $(shell pwd)
 # ifeq ($(DEBUG), 1)
 # ccflags-y += -g -O0
 # endif
-
 .PHONY: insmod rmmod 
-default: insmod
+default: build
 
+build: toa.ko
 toa.ko: toa.c toa.h
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules clean
+	-rm -f *.o *.ko *.mod *.mod.c modules.order  Module.symvers
 
-# install:
-# 	if [ -d "$(INSDIR)" ]; then \
-# 		install -m 664 toa.ko $(INSDIR)/toa.ko; \
-# 	fi
-
-insmod: rmmod toa.ko
-	sudo insmod toa.ko 
+insmod: rmmod build
+	sudo insmod toa.ko toa_map_table_bits=14 vip_enable=1 v6_to_v4_enable=0 v6_to_v4_prefix_str=64:ff9b:: dyndbg=+p
 
 rmmod:
 	-sudo rmmod toa
+

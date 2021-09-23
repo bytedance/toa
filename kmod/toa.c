@@ -8,11 +8,15 @@
 #include <linux/version.h>
 #include <linux/kallsyms.h>
 
+#include <asm/pgtable.h>
+#include <asm/pgtable_types.h>
+
 #include <linux/err.h>
 #include <linux/time.h>
 
 #include <linux/skbuff.h>
 #include <linux/netdevice.h>
+#include <linux/inet.h>
 
 #include <net/tcp.h>
 #include <net/inet_common.h>
@@ -20,874 +24,1664 @@
 #include <net/ipv6.h>
 #include <net/transp_v6.h>
 #include <net/sock.h>
+#include <linux/netfilter.h>
+#include <linux/netfilter_ipv4.h>
 
 #include <linux/sysctl.h>
 #include <linux/fs.h>
 #include <linux/proc_fs.h>
 #include <linux/uaccess.h>
 
-
-
 #include "toa.h"
 
+// #define TOA_USE_MULTI_HOOK 
+#ifdef TOA_USE_MULTI_HOOK
+#include <multi_hook.h>
+#endif
 
-// #include "toa.h"
-// #include <linux/list.h>
 
-// // #define CONFIG_IP_VS_TOA_IPV6
 
-// /*
-//  *	TOA: Address is a new TCP Option
-//  *	Address include ip+port, Now only support IPV4
-//  */
+//  toa stats ------------------------------------
 
-// unsigned long sk_data_ready_addr = 0;
+// const char toa_version[] = "3.1.0";
+#define TOA_VERSION "3.1.0"
 
-// /* sk_user_data type */
-// enum sk_user_data_type {
-//     TOA_SK_USER_DATA_IP4 = 0,
-//     TOA_SK_USER_DATA_IP4_EXTRA = 1,
-//     TOA_SK_USER_DATA_LAST
-// };
+enum
+{
+    STATS_V4_ESTABLISH = 0,
+    STATS_IPV4_OPTION,
+    STATS_IPV4_OPTION_V2,
+    STATS_TCPV4_OPTION,
+    STATS_V4_SAVED,
+    STATS_V6_ESTABLISH,
+    STATS_IPV6_OPTION,
+    STATS_IPV6_OPTION_V2,
+    STATS_TCPV6_OPTION,
+    STATS_V6_SAVED,
 
-// /* toa list table array */
-// #define TOA_TAB_BITS    12
-// #define TOA_TAB_SIZE    (1 << TOA_TAB_BITS)
-// #define TOA_TAB_MASK    (TOA_TAB_SIZE - 1)
+    STATS_GET_V4,
+    STATS_GET_V4_SUCC,
+    STATS_GET_V6,
+    STATS_GET_V6_SUCC,
+    STATS_GET_VNI,
+    STATS_GET_VNI_SUCC,
 
-// struct toa_entry {
-//     struct toa_extra_data toa_data;
-//     struct sock *sk;
+    STATS_MAX,
+};
 
-//     struct list_head list;
-// };
+struct toa_stats
+{
+    __u64 stats[STATS_MAX];
+};
 
-// struct toa_list_head {
-//     struct list_head toa_head;
-//     spinlock_t lock;
-// } __attribute__((__aligned__(SMP_CACHE_BYTES)));
+struct toa_stats __percpu * toa_stats_cpu;
 
-// static struct toa_list_head
-// __toa_list_tab[TOA_TAB_SIZE] __cacheline_aligned;
 
-// /* per-cpu lock for toa */
-// struct toa_sk_lock {
-//     /* lock for sk of toa */
-//     spinlock_t __percpu *lock;
-// };
+// the toa_cpu_stats only be added in the local cpu and can be read from other cpu
+static inline void toa_stats_inc(int index)
+{
+    struct toa_stats* s = this_cpu_ptr(toa_stats_cpu);
+    s->stats[index]++;
+}
 
-// static struct toa_sk_lock toa_sk_lock;
+static void toa_map_show(struct seq_file *seq);
 
-// /*
-//  * Statistics of toa in proc /proc/net/toa_stats
-//  */
+static int toa_stats_show(struct seq_file *seq, void *arg)
+{
+    struct toa_stats global_stats;
+    int i, j;
 
-// struct toa_stats_entry toa_stats[] = {
-// 	TOA_STAT_ITEM("syn_recv_sock_toa", SYN_RECV_SOCK_TOA_CNT),
-// 	TOA_STAT_ITEM("syn_recv_sock_no_toa", SYN_RECV_SOCK_NO_TOA_CNT),
-// 	TOA_STAT_ITEM("getname_toa_ok", GETNAME_TOA_OK_CNT),
-// 	TOA_STAT_ITEM("getname_toa_mismatch", GETNAME_TOA_MISMATCH_CNT),
-// 	TOA_STAT_ITEM("getname_toa_bypass", GETNAME_TOA_BYPASS_CNT),
-// 	TOA_STAT_ITEM("getname_toa_empty", GETNAME_TOA_EMPTY_CNT),
-// 	TOA_STAT_ITEM("toa_entry_alloc", TOA_ENTRY_ADDR_ALLOC_CNT),
-// 	TOA_STAT_ITEM("toa_entry_free", TOA_ENTRY_ADDR_FREE_CNT),
-// 	TOA_STAT_END
-// };
+    seq_printf(seq, "toa version: %s\n", TOA_VERSION);
+    seq_puts(seq, "CPU    V4_ESTB IPV4_OPT IPV4_OPT2 TCPV4_OPT V4_SAVED"
+            " V6_ESTB IPV6_OPT IPV6_OPT2 TCPV6_OPT V6_SAVED"
+            " GET_V4 GET_V4_OK GET_V6 GET_V6_OK GET_VNI GET_VNI_OK\n");
+    
+    memset(&global_stats, 0, sizeof(global_stats));
+    for_each_possible_cpu(i) 
+    {
+        struct toa_stats *s = per_cpu_ptr(toa_stats_cpu, i);
+        __u64 tmp;
 
-// DEFINE_TOA_STAT(struct toa_stat_mib, ext_stats);
+        seq_printf(seq, "%3d:  ", i);
+        for (j = 0; j < STATS_MAX; j++)
+        {   tmp = s->stats[j];
+            global_stats.stats[j] += tmp;
+            seq_printf(seq, "%8llu ", tmp);
+        }
+        seq_printf(seq, "\n");
+    }
 
-// /* calculate toa entry hash key */
-// static inline __u32
-// cal_toa_entry_hash(struct toa_extra_data *ptr_toa_data)
+    seq_printf(seq, "total:");
+    for (j = 0; j < STATS_MAX; j++)
+        seq_printf(seq, "%8llu ", global_stats.stats[j]);
+    seq_printf(seq, "\n");
+
+    toa_map_show(seq);
+
+    return 0;
+}
+
+static int toa_stats_seq_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, toa_stats_show, NULL);
+}
+
+static const struct file_operations toa_stats_fops = 
+{
+    .owner      = THIS_MODULE,
+    .open       = toa_stats_seq_open,
+    .read       = seq_read,
+    .llseek     = seq_lseek,
+    .release    = single_release,
+};
+
+static int toa_stats_init(void)
+{
+    int i;
+
+    toa_stats_cpu = alloc_percpu(struct toa_stats);
+    if  (!toa_stats_cpu)
+    {   pr_warn("%s: toa_stats_cpu failed\n", __func__);
+        return -ENOMEM;
+    }
+
+    for_each_possible_cpu(i)
+    {
+        struct toa_stats* s = per_cpu_ptr(toa_stats_cpu, i);
+        memset(s, 0, sizeof(*s));
+    }
+
+    proc_create("toa_stats", 0, init_net.proc_net, &toa_stats_fops);
+
+    return 0;
+}
+
+static void toa_stats_exit(void)
+{
+    remove_proc_entry("toa_stats", init_net.proc_net);
+    free_percpu(toa_stats_cpu);
+}
+
+
+
+// toa_map ----------------------------------------------------------------------------------------------
+
+enum IP_TYPE {
+    IP_TYPE_V4 = 0,
+    IP_TYPE_V6 = 1,
+};
+
+
+union two_addr{
+    struct{
+        unsigned char saddr[4];
+        unsigned char daddr[4];
+    }ipv4;
+    struct{
+        unsigned char saddr[16];
+        unsigned char daddr[16];
+    }ipv6;
+};
+
+struct four_tuple{
+    unsigned int ip_type: 1; // indicate this is ipv4 or ipv6 addresses;
+    __be16 sport, dport;
+    union two_addr addrs;
+};
+
+// #define FOUR_TUPLE_TYPE_IP_TYPE_MASK 0x1
+
+
+static void four_tuple_display(const char* prefix, const struct four_tuple* tuple)
+{
+#ifdef DEBUG  
+    if  (tuple->ip_type == IP_TYPE_V4)
+    {
+        pr_debug("%s %pI4:%d -> %pI4:%d\n", prefix, 
+               tuple->addrs.ipv4.saddr, ntohs(tuple->sport),
+                tuple->addrs.ipv4.daddr, ntohs(tuple->dport));
+    }
+    else if  (tuple->ip_type == IP_TYPE_V6) 
+    {
+        pr_debug("%s [%pI6]:%d -> [%pI6]:%d\n", prefix, 
+                tuple->addrs.ipv6.saddr, ntohs(tuple->sport),
+                tuple->addrs.ipv6.daddr, ntohs(tuple->dport));
+    }
+#endif
+}
+
+
+struct toa_map_value {
+    struct four_tuple four_tuple;
+    __be32 svni;
+};
+
+
+static void toa_map_value_display(const char* prefix, const struct toa_map_value* value)
+{
+#ifdef DEBUG  
+    if  (value->four_tuple.ip_type == IP_TYPE_V4)
+    {
+        pr_debug("%s %pI4:%d -> %pI4:%d, svni: %u\n", prefix, 
+                value->four_tuple.addrs.ipv4.saddr, ntohs(value->four_tuple.sport),
+                value->four_tuple.addrs.ipv4.daddr, ntohs(value->four_tuple.dport),
+                ntohl(value->svni));
+    }
+    else if  (value->four_tuple.ip_type == IP_TYPE_V6)
+    {
+        pr_debug("%s [%pI6]:%d -> [%pI6]:%d, svni: %u\n", prefix, 
+                value->four_tuple.addrs.ipv6.saddr, ntohs(value->four_tuple.sport),
+                value->four_tuple.addrs.ipv6.daddr, ntohs(value->four_tuple.dport),
+                ntohl(value->svni));
+    }
+#endif
+}
+
+
+struct toa_map_bucket
+{
+    struct hlist_head head;
+    spinlock_t       lock;
+    long long num;
+};
+
+// the address of sk is the master key
+struct toa_map_entry
+{
+    struct hlist_node hlist;
+    
+    struct sock *sk;  // also key
+    // struct four_tuple value;
+    struct toa_map_value value;
+};
+
+
+static int toa_map_table_bits = 12;
+module_param_named(toa_map_table_bits, toa_map_table_bits, int, 0444);
+MODULE_PARM_DESC(toa_map_table_bits, "TOA mapping table hash bits");
+
+static int toa_map_table_size  __read_mostly;
+static int toa_map_table_mask  __read_mostly;
+
+
+static struct toa_map_bucket* toa_map_table __read_mostly;
+static struct kmem_cache *toa_map_cache __read_mostly;
+
+static void toa_map_show(struct seq_file *seq)
+{
+    long long total = 0;
+    long long max_num = 0, min_num = 0xffffffff;
+    unsigned i;
+
+    for (i = 0; i < toa_map_table_size; i++)
+    {
+        long long x =  toa_map_table[i].num;
+        total += x;
+        if  (x > max_num)  max_num = x;
+        if  (x < min_num)  min_num = x;
+    }
+
+    seq_printf(seq, "toa_map: total_num: %lld buckets: %d avg_num: %lld max_num: %lld min_num: %lld\n",
+            total, toa_map_table_size, total / toa_map_table_size, max_num, min_num);
+
+}
+
+static unsigned long toa_sock_hash(struct sock* sk)
+{
+    unsigned long src = (unsigned long)sk;
+    unsigned ans = src;
+    ans ^= src >> 8;
+    ans ^= src >> 16;
+    ans ^= src >> 24;
+    return ans & toa_map_table_mask;
+}
+
+static void toa_map_insert(struct toa_map_entry* entry)
+{
+    int index = toa_sock_hash(entry->sk);
+    struct toa_map_bucket* bucket = toa_map_table + index;
+    struct hlist_head* head = &bucket->head;
+
+    spin_lock_bh(&bucket->lock);
+
+    hlist_add_head_rcu(&entry->hlist, head);
+    bucket->num++;
+
+    spin_unlock_bh(&bucket->lock);
+}
+
+// static bool toa_map_get(struct sock* sk, struct four_tuple* value)
 // {
-// 	__u32 hash_key =
-//         jhash_3words(ntohl(ptr_toa_data->legacy_data.ip),
-//                      ptr_toa_data->legacy_data.port, ptr_toa_data->dst_ip,
-//                      ptr_toa_data->dst_port) & TOA_TAB_MASK;
+//     int index = toa_sock_hash(sk);
+//     struct toa_map_bucket* bucket = toa_map_table + index;
+//     struct hlist_head* head = &bucket->head;
+//     struct toa_map_entry* entry;
+//     bool retval = false;
 
-//     return hash_key;
-// }
+//     spin_lock_bh(&bucket->lock);
 
-// static void
-// toa_entry_hash(struct toa_entry *ptr_entry)
-// {
-//     struct toa_extra_data *ptr_toa_data = &ptr_entry->toa_data;
-//     __u32 hash_key = cal_toa_entry_hash(ptr_toa_data);
-
-//     spin_lock_bh(&__toa_list_tab[hash_key].lock);
-
-//     list_add(&ptr_entry->list, &__toa_list_tab[hash_key].toa_head);
-
-//     spin_unlock_bh(&__toa_list_tab[hash_key].lock);
-
-//     return;
-// }
-
-// static void
-// toa_entry_unhash(struct toa_entry *ptr_entry)
-// {
-//     struct toa_extra_data *ptr_toa_data = &ptr_entry->toa_data;
-//     __u32 hash_key = cal_toa_entry_hash(ptr_toa_data);
-
-//     spin_lock_bh(&__toa_list_tab[hash_key].lock);
-
-//     list_del(&ptr_entry->list);
-
-//     spin_unlock_bh(&__toa_list_tab[hash_key].lock);
-// }
-
-// static void
-// lock_all_toa_sk(void)
-// {
-//     int i;
-//     for_each_possible_cpu(i) {
-//         spinlock_t *lock;
-
-//         lock = per_cpu_ptr(toa_sk_lock.lock, i);
-//         spin_lock_bh(lock);
-//     }
-// }
-
-// static void
-// unlock_all_toa_sk(void)
-// {
-//     int i;
-//     for_each_possible_cpu(i) {
-//         spinlock_t *lock;
-
-//         lock = per_cpu_ptr(toa_sk_lock.lock, i);
-//         spin_unlock_bh(lock);
-//     }
-// }
-
-// static void
-// lock_cpu_toa_sk(void)
-// {
-//     spinlock_t *lock = this_cpu_ptr(toa_sk_lock.lock);
-//     spin_lock_bh(lock);
-// }
-
-// static void
-// unlock_cpu_toa_sk(void)
-// {
-//     spinlock_t *lock = this_cpu_ptr(toa_sk_lock.lock);
-//     spin_unlock_bh(lock);
-// }
-
-// static int
-// init_toa_entry(void)
-// {
-//     int i;
-
-//     for_each_possible_cpu(i) {
-//         spinlock_t *lock;
-
-//         lock = per_cpu_ptr(toa_sk_lock.lock, i);
-//         spin_lock_init(lock);
-//     }
-
-//     for (i = 0; i < TOA_TAB_SIZE; ++i) {
-//         INIT_LIST_HEAD(&__toa_list_tab[i].toa_head);
-//         spin_lock_init(&__toa_list_tab[i].lock);
-//     }
-
-//     toa_sk_lock.lock = alloc_percpu(spinlock_t);
-//     if (toa_sk_lock.lock == NULL) {
-//         TOA_INFO("fail to alloc per cpu toa entry destruct lock\n");
-//         return -ENOMEM;
-//     }
-
-//     return 0;
-// }
-
-// static void 
-// tcp_sk_destruct_toa(struct sock *sk) {
-
-//         lock_cpu_toa_sk();
-
-//         if (sk->sk_user_data) {
-//                 struct toa_entry* ptr_entry = sk->sk_user_data;
-//                 toa_entry_unhash(ptr_entry);
-//                 sk->sk_destruct = inet_sock_destruct;
-//                 sk->sk_user_data = NULL;
-//                 kfree(ptr_entry);
-//                 TOA_INC_STATS(ext_stats, TOA_ENTRY_ADDR_FREE_CNT);
+//     hlist_for_each_entry_rcu(entry, head, hlist)
+//     {
+//         if  (entry->sk == sk)
+//         {   memcpy(value, &entry->value, sizeof(*value));
+//             retval = true;
+//             break;
 //         }
-
-//         inet_sock_destruct(sk);
-
-//         unlock_cpu_toa_sk();
-// }
-
-// static int
-// exit_toa_entry(void)
-// {
-//     int i;
-//     struct list_head *head;
-//     struct toa_entry *ptr_entry;
-//     struct sock *sk;
-
-//     lock_all_toa_sk();
-
-//     for (i = 0; i < TOA_TAB_SIZE; ++i) {
-
-//         spin_lock_bh(&__toa_list_tab[i].lock);
-
-//         head = &__toa_list_tab[i].toa_head;
-//         while (!list_empty(head)) {
-//             ptr_entry = list_first_entry(head, struct toa_entry, list);
-//             sk = ptr_entry->sk;
-
-//             if (sk && sk->sk_user_data &&
-//                 (sk->sk_destruct == tcp_sk_destruct_toa)) {
-
-//                 sk->sk_destruct = inet_sock_destruct;
-//                 sk->sk_user_data = NULL;
-
-//                 TOA_DBG("free toa_entry in __toa_list_tab succ. "
-//                         "ptr_entry : %p, src_ip : "TOA_NIPQUAD_FMT", src_port : %u, "
-// 						"vip: "TOA_NIPQUAD_FMT", dst_port: %u\n",
-//                         ptr_entry,
-//                         NIPQUAD(ptr_entry->toa_data.legacy_data.ip), ntohs(ptr_entry->toa_data.legacy_data.port),
-// 						NIPQUAD(ptr_entry->toa_data.dst_ip), ntohs(ptr_entry->toa_data.dst_port));
-//             } else {
-//                 TOA_DBG("update sk of toa_entry fail. "
-//                         "ptr_entry : %p\n",
-//                         ptr_entry);
-//             }
-
-//             TOA_INC_STATS(ext_stats, TOA_ENTRY_ADDR_FREE_CNT);
-
-//             list_del(&ptr_entry->list);
-//             kfree(ptr_entry);
-//         }
-
-//         spin_unlock_bh(&__toa_list_tab[i].lock);
 //     }
 
-//     unlock_all_toa_sk();
-
-//     synchronize_net();
-
-//     free_percpu(toa_sk_lock.lock);
-//     return 0;
+//     spin_unlock_bh(&bucket->lock);
+    
+//     return retval;
 // }
 
+static bool toa_map_get1(struct sock* sk, struct toa_map_value* value)
+{
+    int index = toa_sock_hash(sk);
+    struct toa_map_bucket* bucket = toa_map_table + index;
+    struct hlist_head* head = &bucket->head;
+    struct toa_map_entry* entry;
+    bool retval = false;
+
+    spin_lock_bh(&bucket->lock);
+
+    hlist_for_each_entry_rcu(entry, head, hlist)
+    {
+        if  (entry->sk == sk)
+        {   memcpy(value, &entry->value, sizeof(*value));
+            retval = true;
+            break;
+        }
+    }
+
+    spin_unlock_bh(&bucket->lock);
+    
+    return retval;
+}
+
+// static void toa_map_remove(struct toa_map_entry* entry)
+static void toa_map_remove(struct sock* sk)
+{
+    int index = toa_sock_hash(sk);
+    struct toa_map_bucket* bucket = toa_map_table + index;
+    struct hlist_head* head = &bucket->head;
+    struct toa_map_entry* entry;
+    struct hlist_node* node;
+
+
+    spin_lock_bh(&bucket->lock);
+
+    hlist_for_each_entry_safe(entry, node, head, hlist)
+    {
+        if  (entry->sk == sk)
+        {
+            hlist_del_rcu(&entry->hlist);
+            entry->sk->sk_destruct = inet_sock_destruct;
+            kmem_cache_free(toa_map_cache, entry);
+            bucket->num--;
+
+            break;
+        }
+    }
+
+    spin_unlock_bh(&bucket->lock);
+}
+
+
+static void tcp_sk_destruct_toa(struct sock* sk);
+
+static void toa_map_flush(void)
+{
+    int i;
+    int count = 0;
+
+
+    for (i = 0; i < toa_map_table_size; i++)
+    {
+        struct toa_map_bucket* bucket = toa_map_table + i;
+        struct hlist_head* head = &bucket->head;
+        struct hlist_node* node;
+        struct toa_map_entry* entry;
+
+        spin_lock_bh(&bucket->lock);
+
+        hlist_for_each_entry_safe(entry, node, head, hlist)
+        {
+            struct sock* sk = entry->sk;
+            count++;
+
+            hlist_del_rcu(&entry->hlist);
+            bucket->num--;
+
+            if  (sk && (sk->sk_destruct == tcp_sk_destruct_toa))
+                sk->sk_destruct = inet_sock_destruct;
+            
+            kmem_cache_free(toa_map_cache, entry);
+        }
+
+        spin_unlock_bh(&bucket->lock);
+    }
+    
+    pr_info("%s: flush %d\n", __func__, count);
+}
+
+static int toa_map_init(void)
+{
+    int i;
+
+    toa_map_table_size = 1 << toa_map_table_bits;
+    toa_map_table_mask = toa_map_table_size - 1;
+
+    toa_map_table = vmalloc(sizeof(struct toa_map_bucket) * toa_map_table_size);
+    if  (!toa_map_table)
+    {   pr_warn("fail to create toa_map_table\n");
+        return -ENOMEM;
+    }
+    
+    for (i = 0; i < toa_map_table_size; i++)
+    {
+        INIT_HLIST_HEAD(&toa_map_table[i].head);
+        spin_lock_init(&toa_map_table[i].lock);
+        toa_map_table[i].num = 0;
+    }
+
+    toa_map_cache = kmem_cache_create("toa_map", 
+        sizeof(struct toa_map_entry), 0, SLAB_HWCACHE_ALIGN, NULL);
+    if  (!toa_map_cache)
+    {   pr_warn("fail to create toa_map_cache\n");
+        return -ENOMEM;
+    }
+
+    return 0;
+}
+
+static void toa_map_exit(void)
+{
+    toa_map_flush();
+    kmem_cache_destroy(toa_map_cache);
+    
+    synchronize_net();
+}
+
+
+// inet_getname -------------------------------------------------------------------------------------------
+
+unsigned long sk_data_ready_addr = 0;
+
+static int vip_enable = 1;
+module_param_named(vip_enable, vip_enable, int, 0444);
+MODULE_PARM_DESC(vip_enable, "disable TTGW VIP and virtul port info by setting it to 0");
+
+static int v6_to_v4_enable = 0;
+module_param_named(v6_to_v4_enable, v6_to_v4_enable, int, 0444);
+MODULE_PARM_DESC(v6_to_v4_enable, "enable specific ipv6 addr trans to ipv4 addr, \
+determined by v6_to_v4_prefix_str's first 96 bits");
+
+static char* v6_to_v4_prefix_str = NULL;
+module_param_named(v6_to_v4_prefix_str, v6_to_v4_prefix_str, charp, 0444);
+MODULE_PARM_DESC(v6_to_v4_prefix_str, "the first 96 bits as prefix \
+to determine wheather trans an ipv6 addr to ipv4 addr");
+
+static char* v6_to_v4_prefix_str_default = "64:ff9b::";
+static u8 v6_to_v4_prefix_addr[16]; // the first 96 bit as prefix to determine v6 to v4;
 
 
 
+static int toa_ipv6_addr_assign(__be16 port, u8* addr, struct sockaddr* uaddr)
+{
+    if  (unlikely(v6_to_v4_enable == 1 && strncmp(addr, v6_to_v4_prefix_addr, 12) == 0))
+    {   // trans v6 to v4;
+        struct sockaddr_in* sin = (struct sockaddr_in*)uaddr;
+        sin->sin_addr.s_addr = *(unsigned*)(addr + 12);
+        sin->sin_port = port;
+        sin->sin_family = AF_INET;
+        return sizeof(*sin);
+    }
+    else
+    {
+        struct sockaddr_in6* sin = (struct sockaddr_in6*)uaddr;
+        memcpy(&sin->sin6_addr, addr, 16);
+        sin->sin6_port = port;
+        sin->sin6_family = AF_INET6;
+        return sizeof(*sin);
+    }
+} 
+
+
+static int four_tuple_to_sockaddr_new(struct four_tuple* value, struct sockaddr* uaddr, int* len_p, bool peer)
+{
+    int ret = -1;
+
+    if  (value->ip_type == IP_TYPE_V4)
+    {   
+        struct sockaddr_in* sin = (struct sockaddr_in*)uaddr;
+
+        if  (peer)
+        {   if  (value->sport)
+            {   sin->sin_addr.s_addr = *(unsigned*)value->addrs.ipv4.saddr;
+                sin->sin_port = value->sport;
+                sin->sin_family = AF_INET;
+                *len_p = sizeof(*sin);
+                ret = 0;
+            }
+        }
+        else
+        {   if  (value->dport)
+            {   sin->sin_addr.s_addr = *(unsigned*)value->addrs.ipv4.daddr;
+                sin->sin_port = value->dport;
+                sin->sin_family = AF_INET;
+                *len_p = sizeof(*sin);
+                ret = 0;
+            }
+        }
+    }
+    else if  (value->ip_type == IP_TYPE_V6)
+    {
+        if  (peer)
+        {   if  (value->sport)
+            {   
+                *len_p = toa_ipv6_addr_assign(value->sport, value->addrs.ipv6.saddr, uaddr);
+                ret = 0;
+            }
+        }
+        else
+        {   if  (value->dport)
+            {   
+                *len_p = toa_ipv6_addr_assign(value->dport, value->addrs.ipv6.daddr, uaddr);
+                ret = 0;
+            }
+        }
+    }
+
+    return ret;
+}
+
+static int inet_getname_with_toa(struct socket* sock, int af_inet, struct sockaddr* uaddr, int* len_p, int peer)
+{
+    struct sock* sk = sock->sk;
+    bool found = false;
+    struct toa_map_value value;
+
+    if  (unlikely(vip_enable== 0 && peer == 0))
+        return -1;
+
+    found = toa_map_get1(sk, &value);
+
+    if  (found)
+    {
+        four_tuple_display(peer? "inet_getname_with_toa peer:  " : "inet_getname_with_toa local: ", &value.four_tuple);
+
+        return four_tuple_to_sockaddr_new(&value.four_tuple, uaddr, len_p, peer);
+    }
+
+    return -1;
+}
 
 
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
 
+typedef int (*inet_getname_t)(struct socket *sock, struct sockaddr *uaddr, int peer);
 
+inet_getname_t inet_getname_prev;
+inet_getname_t inet6_getname_prev;
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// /*
-//  * Funcs for toa hooks
-//  */
-
-// // toa get name --------------------------------------------------
-
-// /* Parse TCP options in skb, try to get client ip, port
-//  * @param skb [in] received skb, it should be a ack/get-ack packet.
-//  * @return NULL if we don't get client ip/port;
-//  *         value of toa_data in ret_ptr if we get client ip/port.
-//  */
-// static void *get_toa_data(struct sk_buff *skb, enum sk_user_data_type *type)
+// static int inet_getname_toa_in_multi_hook(struct socket *sock, struct sockaddr *uaddr,int peer)
 // {
-// 	struct tcphdr *th;
-// 	int length;
-// 	unsigned char *ptr;
-
-// 	unsigned char buff[(15 * 4) - sizeof(struct tcphdr)];
-
-// 	TOA_DBG("get_toa_data called\n");
-
-// 	if (NULL != skb) {
-// 		th = tcp_hdr(skb);
-// 		length = (th->doff * 4) - sizeof(struct tcphdr);
-// 		ptr = skb_header_pointer(skb, sizeof(struct tcphdr),
-// 					length, buff);
-// 		if (!ptr)
-// 			return NULL;
-
-// 		while (length > 0) {
-// 			int opcode = *ptr++;
-// 			int opsize;
-// 			switch (opcode) {
-// 			case TCPOPT_EOL:
-// 				return NULL;
-// 			case TCPOPT_NOP:	/* Ref: RFC 793 section 3.1 */
-// 				length--;
-// 				continue;
-// 			default:
-// 				opsize = *ptr++;
-// 				if (opsize < 2)	/* "silly options" */
-// 					return NULL;
-// 				if (opsize > length)
-// 					/* don't parse partial options */
-// 					return NULL;
-// 				if (TCPOPT_TOA == opcode &&
-// 				    (TCPOLEN_TOA_V1 == opsize || TCPOLEN_TOA_V2 == opsize)) {
-// 					struct toa_extra_data *ptr_toa_data;
-// 					struct toa_entry *ptr_entry = kzalloc(sizeof(struct toa_entry), GFP_ATOMIC);
-// 					if (!ptr_entry) {
-// 						return NULL;
-// 					}
-// 					TOA_INC_STATS(ext_stats, TOA_ENTRY_ADDR_ALLOC_CNT);
-
-// 					ptr_toa_data = &ptr_entry->toa_data;
-// 					if (TCPOLEN_TOA_V1 == opsize) {
-// 						memcpy(&ptr_toa_data->legacy_data, ptr - 2,
-// 						       sizeof(ptr_toa_data->legacy_data));
-// 						TOA_DBG("find toa data: ip = "
-// 							"%u.%u.%u.%u, port = %u\n",
-// 							NIPQUAD(ptr_toa_data->legacy_data.ip),
-// 							ntohs(ptr_toa_data->legacy_data.port));
-// 						*type = TOA_SK_USER_DATA_IP4;
-// 					} else {
-// 						memcpy(ptr_toa_data, ptr - 2, sizeof(struct toa_extra_data));
-
-// 						TOA_DBG("find toa data : src_ip = "
-// 							TOA_NIPQUAD_FMT", src_port = %u, vip = "
-// 							TOA_NIPQUAD_FMT", dst_port = %u,"
-// 							" coded toa entry data: %p\n",
-// 							NIPQUAD(ptr_toa_data->legacy_data.ip),
-// 							ntohs(ptr_toa_data->legacy_data.port),
-// 							NIPQUAD(ptr_toa_data->dst_ip),
-// 							ntohs(ptr_toa_data->dst_port),
-// 							ptr_toa_data);
-// 						*type = TOA_SK_USER_DATA_IP4_EXTRA;
-// 					}
-
-// 					return ptr_entry;					
-// 				}
-
-// 				ptr += opsize - 2;
-// 				length -= opsize;
-// 			}
-// 		}
-// 	}
-// 	return NULL;
-// }
-
-// /* get client ip from socket
-//  * @param sock [in] the socket to getpeername() or getsockname()
-//  * @param uaddr [out] the place to put client ip, port
-//  * @param uaddr_len [out] lenth of @uaddr
-//  * @peer [in] if(peer), try to get remote address; if(!peer),
-//  *  try to get local address
-//  * @return return what the original inet_getname() returns.
-//  */
-// #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
-// static int
-// inet_getname_toa(struct socket *sock, struct sockaddr *uaddr,
-// 		int peer)
-// #else
-// static int
-// inet_getname_toa(struct socket *sock, struct sockaddr *uaddr,
-// 		int *uaddr_len, int peer)
-// #endif
-// {
-// 	int retval = 0;
-// 	struct sock *sk = sock->sk;
-// 	struct sockaddr_in *sin = (struct sockaddr_in *) uaddr;
-// 	struct toa_extra_data extra_tdata;
-
-
-// 	/* call orginal one */
-// #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
-// 	retval = inet_getname(sock, uaddr, peer);
-// #else
-// 	retval = inet_getname(sock, uaddr, uaddr_len, peer)
-// #endif
-
-// 	/* set our value if need */
-// 	if (retval >= 0 && NULL != sk->sk_user_data) {
-// 		if (sk_data_ready_addr == (unsigned long) sk->sk_data_ready) {
-// 			memcpy(&extra_tdata, sk->sk_user_data, sizeof(extra_tdata));
-// 			TOA_DBG("toa.opcode:%d, toa.opsize:%d", extra_tdata.legacy_data.opcode, extra_tdata.legacy_data.opsize);
-// 			if (TCPOPT_TOA == extra_tdata.legacy_data.opcode &&
-// 			    TCPOLEN_TOA_V1 == extra_tdata.legacy_data.opsize && peer) {
-// 				TOA_INC_STATS(ext_stats, GETNAME_TOA_OK_CNT);
-// 				TOA_DBG("inet_getname_toa peer: set new sockaddr, "
-// 					"ip %u.%u.%u.%u -> %u.%u.%u.%u, port "
-// 					"%u -> %u\n",
-// 					NIPQUAD(sin->sin_addr.s_addr),
-// 					NIPQUAD(extra_tdata.legacy_data.ip), ntohs(sin->sin_port),
-// 					ntohs(extra_tdata.legacy_data.port));
-// 				sin->sin_port = extra_tdata.legacy_data.port;
-// 				sin->sin_addr.s_addr = extra_tdata.legacy_data.ip;
-// 			} else if (TCPOPT_TOA == extra_tdata.legacy_data.opcode &&
-// 				TCPOLEN_TOA_V2 == extra_tdata.legacy_data.opsize) {
-// 				TOA_INC_STATS(ext_stats, GETNAME_TOA_OK_CNT);
-// 				if (peer) {
-// 					TOA_DBG("inet_getname_toa: set new sockaddr peer, "
-// 						"ip %u.%u.%u.%u -> %u.%u.%u.%u, port "
-// 						"%u -> %u\n",
-// 						NIPQUAD(sin->sin_addr.s_addr),
-// 						NIPQUAD(extra_tdata.legacy_data.ip), ntohs(sin->sin_port),
-// 						ntohs(extra_tdata.legacy_data.port));
-// 					sin->sin_port = extra_tdata.legacy_data.port;
-// 					sin->sin_addr.s_addr = extra_tdata.legacy_data.ip;
-// 				} else {
-// 					TOA_DBG("inet_getname_toa: set new sockaddr local, "
-// 						"ip %u.%u.%u.%u -> %u.%u.%u.%u, port "
-// 						"%u -> %u\n",
-// 						NIPQUAD(sin->sin_addr.s_addr),
-// 						NIPQUAD(extra_tdata.dst_ip), ntohs(sin->sin_port),
-// 						ntohs(extra_tdata.dst_port));
-// 					sin->sin_port = extra_tdata.dst_port;
-// 					sin->sin_addr.s_addr = extra_tdata.dst_ip;
-// 				}
-// 			} else { /* sk_user_data doesn't belong to us */
-// 				TOA_INC_STATS(ext_stats,
-// 						GETNAME_TOA_MISMATCH_CNT);
-// 				TOA_DBG("inet_getname_toa: invalid toa data, "
-// 					"ip %u.%u.%u.%u port %u opcode %u "
-// 					"opsize %u\n",
-// 					NIPQUAD(extra_tdata.legacy_data.ip), ntohs(extra_tdata.legacy_data.port),
-// 					extra_tdata.legacy_data.opcode, extra_tdata.legacy_data.opsize);
-// 			}
-// 		} else {
-// 			TOA_INC_STATS(ext_stats, GETNAME_TOA_BYPASS_CNT);
-// 		}
-// 	} else { /* no need to get client ip */
-// 		TOA_INC_STATS(ext_stats, GETNAME_TOA_EMPTY_CNT);
-// 	}
-
-// 	return retval;
-// }
-
-// #ifdef CONFIG_IP_VS_TOA_IPV6
-// #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
-// static int
-// inet6_getname_toa(struct socket *sock, struct sockaddr *uaddr,
-// 		  int peer)
-// #else
-// static int
-// inet6_getname_toa(struct socket *sock, struct sockaddr *uaddr,
-// 		  int *uaddr_len, int peer)
-// #endif
-// {
-// 	int retval = 0;
-// 	struct sock *sk = sock->sk;
-// 	struct sockaddr_in6 *sin = (struct sockaddr_in6 *) uaddr;
-// 	struct toa_data tdata;
-
-// 	TOA_DBG("inet6_getname_toa called, sk->sk_user_data is %p\n",
-// 		sk->sk_user_data);
-
-// 	/* call orginal one */
-// #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
-// 	retval = inet6_getname(sock, uaddr, peer);
-// #else
-// 	retval = inet6_getname(sock, uaddr, uaddr_len, peer);
-// #endif
-
-// 	/* set our value if need */
-// 	if (retval >= 0 && NULL != sk->sk_user_data && peer) {
-// 		if (sk_data_ready_addr == (unsigned long) sk->sk_data_ready) {
-// 			memcpy(&tdata, &sk->sk_user_data, sizeof(tdata));
-// 			if (TCPOPT_TOA == tdata.opcode &&
-// 			    TCPOLEN_TOA == tdata.opsize) {
-// 				TOA_INC_STATS(ext_stats, GETNAME_TOA_OK_CNT);
-// 				sin->sin6_port = tdata.port;
-// 				ipv6_addr_set(&sin->sin6_addr, 0, 0,
-// 					      htonl(0x0000FFFF), tdata.ip);
-// 			} else { /* sk_user_data doesn't belong to us */
-// 				TOA_INC_STATS(ext_stats,
-// 					      GETNAME_TOA_MISMATCH_CNT);
-// 			}
-// 		} else {
-// 			TOA_INC_STATS(ext_stats, GETNAME_TOA_BYPASS_CNT);
-// 		}
-// 	} else { /* no need to get client ip */
-// 		TOA_INC_STATS(ext_stats, GETNAME_TOA_EMPTY_CNT);
-// 	}
-
-// 	return retval;
-// }
-// #endif
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// // toa hook -----------------------------------------------------
-
-// /* The three way handshake has completed - we got a valid synack -
-//  * now create the new socket.
-//  * We need to save toa data into the new socket.
-//  * @param sk [out]  the socket
-//  * @param skb [in] the ack/ack-get packet
-//  * @param req [in] the open request for this connection
-//  * @param dst [out] route cache entry
-//  * @return NULL if fail new socket if succeed.
-//  */
-//  #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
-//  static struct sock *
-//  tcp_v4_syn_recv_sock_toa(const struct sock *sk, struct sk_buff *skb,
-// 			struct request_sock *req,
-// 			struct dst_entry *dst,
-// 			struct request_sock *req_unhash,
-// 			bool *own_req)
-// #else
-// static struct sock *
-// tcp_v4_syn_recv_sock_toa(struct sock *sk, struct sk_buff *skb,
-// 			struct request_sock *req, struct dst_entry *dst)
-// #endif
-// {
-// 	struct sock *newsock = NULL;
-//     enum sk_user_data_type type;
-
-// 	TOA_DBG("tcp_v4_syn_recv_sock_toa called\n");
-
-// 	/* call orginal one */
-// #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0)
-// 	newsock = tcp_v4_syn_recv_sock(sk, skb, req, dst, req_unhash, own_req);
-// #else
-// 	newsock = tcp_v4_syn_recv_sock(sk, skb, req, dst);
-// #endif
-
-//     // struct sockaddr addr;
-// 	// sizeof(struct sockaddr);
-// 	// struct sockaddr_in addr;
-// 	// sizeof(struct sockaddr_in6);
-// 	// sizeof(struct in6_addr);
-// 	// sizeof(struct sockaddr_storage);
-
-// 	/* set our value if need */
-// 	if (NULL != newsock && NULL == newsock->sk_user_data) {
-
-// 		newsock->sk_user_data = get_toa_data(skb, &type);
-		
-// 		if (NULL != newsock->sk_user_data) {
-// 			if (type == TOA_SK_USER_DATA_IP4 || type == TOA_SK_USER_DATA_IP4_EXTRA) {
-// 			struct toa_entry *ptr_entry = newsock->sk_user_data;
-// 			ptr_entry->sk = newsock;
-// 			toa_entry_hash(ptr_entry);
-
-// 			newsock->sk_destruct = tcp_sk_destruct_toa;
-// 			TOA_INC_STATS(ext_stats, SYN_RECV_SOCK_TOA_CNT);
-// 			}
-// 		} else
-// 			TOA_INC_STATS(ext_stats, SYN_RECV_SOCK_NO_TOA_CNT);
-
-// 		TOA_DBG("tcp_v4_syn_recv_sock_toa: set "
-// 			"sk->sk_user_data to %p\n",
-// 			newsock->sk_user_data);
-// 	}
-// 	return newsock;
-// }
-
-// #ifdef CONFIG_IP_VS_TOA_IPV6
-// static struct sock *
-// tcp_v6_syn_recv_sock_toa(struct sock *sk, struct sk_buff *skb,
-// 			 struct request_sock *req, struct dst_entry *dst)
-// {
-// 	struct sock *newsock = NULL;
-// 	enum toa_sk_user_data_type type;
-
-// 	TOA_DBG("tcp_v4_syn_recv_sock_toa called\n");
-
-// 	/* call orginal one */
-// 	newsock = tcp_v6_syn_recv_sock(sk, skb, req, dst);
-
-// 	/* set our value if need */
-// 	if (NULL != newsock && NULL == newsock->sk_user_data) {
-// 		newsock->sk_user_data = get_toa_data(skb, &type);
-// 		if (NULL != newsock->sk_user_data)
-// 			TOA_INC_STATS(ext_stats, SYN_RECV_SOCK_TOA_CNT);
-// 		else
-// 			TOA_INC_STATS(ext_stats, SYN_RECV_SOCK_NO_TOA_CNT);
-// 	}
-// 	return newsock;
-// }
-// #endif
-
-// /*
-//  * HOOK FUNCS
-//  */
-
-// /* replace the functions with our functions */
-// static inline int
-// hook_toa_functions(void)
-// {
-// 	unsigned int level;
-// 	pte_t *pte;
-
-// 	/* hook inet_getname for ipv4 */
-// 	struct proto_ops *inet_stream_ops_p =
-// 			(struct proto_ops *)&inet_stream_ops;
-// 	/* hook tcp_v4_syn_recv_sock for ipv4 */
-// 	struct inet_connection_sock_af_ops *ipv4_specific_p =
-// 			(struct inet_connection_sock_af_ops *)&ipv4_specific;
-// #ifdef CONFIG_IP_VS_TOA_IPV6
-// 	/* hook inet6_getname for ipv6 */
-// 	struct proto_ops *inet6_stream_ops_p =
-// 			(struct proto_ops *)&inet6_stream_ops;
-// 	/* hook tcp_v6_syn_recv_sock for ipv6 */
-// 	struct inet_connection_sock_af_ops *ipv6_specific_p =
-// 			(struct inet_connection_sock_af_ops *)&ipv6_specific;
-// #endif
-
-// 	pte = lookup_address((unsigned long )inet_stream_ops_p, &level);
-// 	if (pte == NULL)
-// 		return 1;
-// 	if (pte->pte & ~_PAGE_RW) {
-// 		pte->pte |= _PAGE_RW;
-// 	}
-
-// 	inet_stream_ops_p->getname = inet_getname_toa;
-// 	TOA_INFO("CPU [%u] hooked inet_getname <%p> --> <%p>\n",
-// 		smp_processor_id(), inet_getname, inet_stream_ops_p->getname);
-
-// #ifdef CONFIG_IP_VS_TOA_IPV6
-// 	inet6_stream_ops_p->getname = inet6_getname_toa;
-// 	TOA_INFO("CPU [%u] hooked inet6_getname <%p> --> <%p>\n",
-// 		smp_processor_id(), inet6_getname, inet6_stream_ops_p->getname);
-// #endif
-
-// 	ipv4_specific_p->syn_recv_sock = tcp_v4_syn_recv_sock_toa;
-// 	TOA_INFO("CPU [%u] hooked tcp_v4_syn_recv_sock <%p> --> <%p>\n",
-// 		smp_processor_id(), tcp_v4_syn_recv_sock,
-// 		ipv4_specific_p->syn_recv_sock);
-
-// #ifdef CONFIG_IP_VS_TOA_IPV6
-// 	ipv6_specific_p->syn_recv_sock = tcp_v6_syn_recv_sock_toa;
-// 	TOA_INFO("CPU [%u] hooked tcp_v6_syn_recv_sock <%p> --> <%p>\n",
-// 		smp_processor_id(), tcp_v6_syn_recv_sock,
-// 		ipv6_specific_p->syn_recv_sock);
-// #endif
-
-// 	pte = lookup_address((unsigned long )inet_stream_ops_p, &level);
-// 	if (pte == NULL)
-// 		return 1;
-// 	pte->pte |= pte->pte &~_PAGE_RW;
-
-// 	return 0;
-// }
-
-// /* replace the functions to original ones */
-// static int
-// unhook_toa_functions(void)
-// {
-// 	unsigned int level;
-// 	pte_t *pte;
-
-// 	/* unhook inet_getname for ipv4 */
-// 	struct proto_ops *inet_stream_ops_p =
-// 			(struct proto_ops *)&inet_stream_ops;
-// 	/* unhook tcp_v4_syn_recv_sock for ipv4 */
-// 	struct inet_connection_sock_af_ops *ipv4_specific_p =
-// 			(struct inet_connection_sock_af_ops *)&ipv4_specific;
-
-// #ifdef CONFIG_IP_VS_TOA_IPV6
-// 	/* unhook inet6_getname for ipv6 */
-// 	struct proto_ops *inet6_stream_ops_p =
-// 			(struct proto_ops *)&inet6_stream_ops;
-// 	/* unhook tcp_v6_syn_recv_sock for ipv6 */
-// 	struct inet_connection_sock_af_ops *ipv6_specific_p =
-// 			(struct inet_connection_sock_af_ops *)&ipv6_specific;
-// #endif
-
-// 	pte = lookup_address((unsigned long )inet_stream_ops_p, &level);
-// 	if (pte == NULL)
-// 		return 1;
-// 	if (pte->pte & ~_PAGE_RW) {
-// 		pte->pte |= _PAGE_RW;
-// 	}
-
-// 	inet_stream_ops_p->getname = inet_getname;
-// 	TOA_INFO("CPU [%u] unhooked inet_getname\n",
-// 		smp_processor_id());
-
-// #ifdef CONFIG_IP_VS_TOA_IPV6
-// 	inet6_stream_ops_p->getname = inet6_getname;
-// 	TOA_INFO("CPU [%u] unhooked inet6_getname\n",
-// 		smp_processor_id());
-// #endif
-
-// 	ipv4_specific_p->syn_recv_sock = tcp_v4_syn_recv_sock;
-// 	TOA_INFO("CPU [%u] unhooked tcp_v4_syn_recv_sock\n",
-// 		smp_processor_id());
-
-// #ifdef CONFIG_IP_VS_TOA_IPV6
-// 	ipv6_specific_p->syn_recv_sock = tcp_v6_syn_recv_sock;
-// 	TOA_INFO("CPU [%u] unhooked tcp_v6_syn_recv_sock\n",
-// 		smp_processor_id());
-// #endif
-
-// 	pte = lookup_address((unsigned long )inet_stream_ops_p, &level);
-// 	if (pte == NULL)
-// 		return 1;
-// 	pte->pte |= pte->pte &~_PAGE_RW;
-
-// 	return 0;
+//     pr_debug("inet_getname_toa_in_multi_hook\n");
+//     return inet_getname_prev(sock, uaddr, peer);
+//     // return 0;
 // }
 
 
-// // toa statistic -----------------------------------------------------------------------------
+static int inet_getname_toa(struct socket *sock, struct sockaddr *uaddr,int peer)
+{
+    int retval = 0;
+    int new_len = 0;
+    toa_stats_inc(STATS_GET_V4);
+    // pr_debug("inet_getname_toa\n");
 
-// /*
-//  * Statistics of toa in proc /proc/net/toa_stats
-//  */
-// static int toa_stats_show(struct seq_file *seq, void *v)
-// {
-// 	int i, j, cpu_nr;
+    retval = inet_getname_prev(sock, uaddr, peer);
+    if  (retval < 0)  return retval;
 
-// 	/* print CPU first */
-// 	seq_printf(seq, "                                  ");
-// 	cpu_nr = num_possible_cpus();
-// 	for (i = 0; i < cpu_nr; i++)
-// 		if (cpu_online(i))
-// 			seq_printf(seq, "CPU%d       ", i);
-// 	seq_putc(seq, '\n');
+    if  (inet_getname_with_toa(sock, AF_INET, uaddr, &new_len, peer) == 0)
+    {   retval = new_len;
+        toa_stats_inc(STATS_GET_V4_SUCC);
+    }
 
-// 	i = 0;
-// 	while (NULL != toa_stats[i].name) {
-// 		seq_printf(seq, "%-25s:", toa_stats[i].name);
-// 		for (j = 0; j < cpu_nr; j++) {
-// 			if (cpu_online(j)) {
-// 				seq_printf(seq, "%10lu ", *(
-// 					((unsigned long *) per_cpu_ptr(
-// 					ext_stats, j)) + toa_stats[i].entry
-// 					));
-// 			}
-// 		}
-// 		seq_putc(seq, '\n');
-// 		i++;
-// 	}
-// 	return 0;
-// }
+    return retval;
+}
 
-// static int toa_stats_seq_open(struct inode *inode, struct file *file)
-// {
-// 	return single_open(file, toa_stats_show, NULL);
-// }
+static int inet6_getname_toa(struct socket *sock, struct sockaddr *uaddr, int peer)
+{
+    int retval = 0;
+    int new_len = 0;
+    toa_stats_inc(STATS_GET_V6);
 
-// static const struct file_operations toa_stats_fops = {
-// 	.owner = THIS_MODULE,
-// 	.open = toa_stats_seq_open,
-// 	.read = seq_read,
-// 	.llseek = seq_lseek,
-// 	.release = single_release,
-// };
+    retval = inet6_getname_prev(sock, uaddr, peer);
+    if  (retval < 0)  return retval;
 
 
-// // toa module init -------------------------------------------------
+    if  (inet_getname_with_toa(sock, AF_INET6, uaddr, &new_len, peer) == 0)
+    {   retval = new_len;
+        toa_stats_inc(STATS_GET_V6_SUCC);
+    }
 
-// /*
-//  * TOA module init and destory
-//  */
+    return retval;
+}
 
-// /* module init */
-// static int __init
-// toa_init(void)
-// {
-// 	/* alloc statistics array for toa */
-// 	ext_stats = alloc_percpu(struct toa_stat_mib);
-// 	if (NULL == ext_stats)
-// 		return 1;
-// 	proc_create("toa_stats", 0, init_net.proc_net, &toa_stats_fops);
 
-// 	/* get the address of function sock_def_readable
-// 	 * so later we can know whether the sock is for rpc, tux or others
-// 	 */
-// 	sk_data_ready_addr = kallsyms_lookup_name("sock_def_readable");
-// 	TOA_INFO("CPU [%u] sk_data_ready_addr = "
-// 		"kallsyms_lookup_name(sock_def_readable) = %lu\n",
-// 		 smp_processor_id(), sk_data_ready_addr);
-// 	if (0 == sk_data_ready_addr) {
-// 		TOA_INFO("cannot find sock_def_readable.\n");
-// 		goto err;
-// 	}
+#else
 
-//     if (0 != init_toa_entry()) {
-//         TOA_INFO("init toa entry fail.\n");
-//         goto err;
-//     }
 
-// 	/* hook funcs for parse and get toa */
-// 	if (0 != hook_toa_functions()) {
-// 		TOA_INFO("cannot hook toa functions.\n");
-// 		goto err;
-// 	}
+typedef int (*inet_getname_t)(struct socket *sock, struct sockaddr *uaddr, int *uaddr_len, int peer);
 
-// 	TOA_INFO("toa loaded\n");
-// 	return 0;
+inet_getname_t inet_getname_prev;
+inet_getname_t inet6_getname_prev;
 
-// err:
-// 	remove_proc_entry("toa_stats",init_net.proc_net);
-// 	if (NULL != ext_stats) {
-// 		free_percpu(ext_stats);
-// 		ext_stats = NULL;
-// 	}
+static int inet_getname_toa(struct socket *sock, struct sockaddr *uaddr, int *uaddr_len, int peer)
+{
+    int retval = 0;
+    int new_len = 0;
+    toa_stats_inc(STATS_GET_V4);
 
-// 	return 1;
-// }
+    retval = inet_getname_prev(sock, uaddr, uaddr_len, peer);
+    if  (retval < 0)  return retval;
 
-// /* module cleanup*/
-// static void __exit
-// toa_exit(void)
-// {
-// 	unhook_toa_functions();
-// 	synchronize_net();
+    if  (inet_getname_with_toa(sock, AF_INET, uaddr, &new_len, peer) == 0)
+    {   
+        *uaddr_len = new_len;
+        toa_stats_inc(STATS_GET_V4_SUCC);
+    }
 
-//     if (0 != exit_toa_entry()) {
-//         TOA_INFO("exit toa entry fail.\n");
-//     }    
+    return retval;
+}
 
-// 	remove_proc_entry("toa_stats",init_net.proc_net);
-// 	if (NULL != ext_stats) {
-// 		free_percpu(ext_stats);
-// 		ext_stats = NULL;
-// 	}
-// 	TOA_INFO("toa unloaded\n");
+static int inet6_getname_toa(struct socket *sock, struct sockaddr *uaddr, int *uaddr_len, int peer)
+{
+    int retval = 0;
+    int new_len = 0;
+    toa_stats_inc(STATS_GET_V6);
 
-// 	pr_debug("-----------------------------------------\n");
-// }
+    retval = inet6_getname_prev(sock, uaddr, uaddr_len, peer);
+    if  (retval < 0)  return retval;
+
+    if  (inet_getname_with_toa(sock, AF_INET6, uaddr, &new_len, peer) == 0)
+    {   
+        *uaddr_len = new_len;
+        toa_stats_inc(STATS_GET_V6_SUCC);
+    }
+
+    return retval;
+}
+
+#endif
+
+
+// toa sockopt  ---------------------------------------------------------------------------------------
+
+static int toa_sockopt_set(struct sock *sk, int cmd, void __user *user, unsigned int len)
+{
+    return 0;
+}
+
+static int toa_sockopt_get(struct sock *sk, int cmd, void __user *user, int *len)
+{
+    // struct four_tuple_with_vni value;
+    struct toa_map_value value;
+    unsigned int vni = 0;
+    // pr_debug("toa_sockopt_get: cmd: %d", cmd);
+
+    if (cmd == TOA_SO_GET_VNI)
+    {   
+        toa_stats_inc(STATS_GET_VNI);
+        
+        if (!user || !len || *len < sizeof(unsigned int))
+        {   return -EINVAL;
+        }
+
+        if (toa_map_get1(sk, &value))
+        {   vni = ntohl(value.svni);
+        }
+
+        if (copy_to_user(user, &vni, sizeof(vni)) != 0)
+        {   return -ENOMEM;
+        }
+
+        toa_stats_inc(STATS_GET_VNI_SUCC);
+        pr_debug("toa_sockopt_get: succ, vni: %u\n", vni);
+        return 0;
+    }
+    else
+    {   pr_warn("toa_sockopt_get bad cmd: %d", cmd);
+        return -EINVAL;
+    }
+
+    // return 0;
+}
+
+
+static struct nf_sockopt_ops toa_sockopts = {
+    .pf          = PF_INET,
+    .owner        = THIS_MODULE,
+    /* set */
+    .set_optmin    = TOA_SO_BASE,
+    .set_optmax    = TOA_SO_SET_MAX + 1,
+    .set        = toa_sockopt_set,
+    /* get */
+    .get_optmin    = TOA_SO_BASE,
+    .get_optmax    = TOA_SO_GET_MAX + 1,
+    .get        = toa_sockopt_get,
+};
+
+static int toa_sockopt_init(void)
+{
+    int err;
+    /* socket option */
+    err = nf_register_sockopt(&toa_sockopts);
+    if (err != 0) {
+        pr_warn("fail to register sockopt\n");
+        return -ENOMEM;
+    }
+    return 0;
+}
+
+static void toa_sockopt_exit(void)
+{
+    nf_unregister_sockopt(&toa_sockopts);
+}
+
+
+// tcp_hook -------------------------------------------------------------------------------------------
+
+
+static void tcp_ip_to_four_tuple(enum IP_TYPE type, void* ip, struct tcphdr* tcph, struct four_tuple* outside)
+{
+    outside->ip_type = type;
+    outside->sport = tcph->source;
+    outside->dport = tcph->dest;
+    memset(&outside->addrs, 0, sizeof(outside->addrs));
+
+    if  (type == 0)
+    {   struct iphdr* iph = ip;
+        *(unsigned*)outside->addrs.ipv4.saddr = iph->saddr;
+        *(unsigned*)outside->addrs.ipv4.daddr = iph->daddr;
+    }
+    else if  (type == 1)
+    {   struct ipv6hdr* ip6h = ip;
+        memcpy(outside->addrs.ipv6.saddr, &ip6h->saddr, 16);
+        memcpy(outside->addrs.ipv6.daddr, &ip6h->daddr, 16);
+    }
+}
+
+static void tcp_ip_display(const char* prefix, enum IP_TYPE type, void* ip, struct tcphdr* tcph)
+{
+    struct four_tuple outside;
+    tcp_ip_to_four_tuple(type, ip, tcph, &outside);
+    four_tuple_display(prefix, &outside);
+}
+
+
+static void tcp_sk_destruct_toa(struct sock* sk)
+{
+    toa_map_remove(sk);
+    inet_sock_destruct(sk);
+}
+
+
+struct ip_option{
+    union{
+        struct{
+            __u8 type;
+            __u8 length;
+            __u8 operation;
+            __u8 padding;
+        }ipv4;
+        struct{
+            __u8 nexthdr;
+            __u8 hdrlen;
+            __u8 option;
+            __u8 optlen;
+        }ipv6;
+    }header;
+    
+    __be16 sport, dport;
+    
+    union two_addr addrs;
+};
+
+#define IPV4_OPTION_TYPE 31
+#define IPV4_OPTION_ASYM_TYPE 30
+#define IPV6_HEADER_OPTION 31
+#define IPV6_HEADER_ASYM_OPTION 30
+
+#define IP_OPTION_IPV4_LEN  16
+#define IP_OPTION_IPV6_LEN  40
+
+#define IPV6_HEADER_IPV4_LEN ((IP_OPTION_IPV4_LEN) / 8 - 1)
+#define IPV6_HEADER_IPV6_LEN ((IP_OPTION_IPV6_LEN) / 8 - 1)
+#define IPV6_HEADER_OPTION_IPV4_LEN (IP_OPTION_IPV4_LEN - 4)
+#define IPV6_HEADER_OPTION_IPV6_LEN (IP_OPTION_IPV6_LEN - 4)
+
+
+
+
+static int ip_option_to_four_tuple(enum IP_TYPE outside, struct ip_option* src, struct four_tuple* dst)
+{
+    int inside = -1;
+    
+    if  (outside == IP_TYPE_V4){
+        if  (src->header.ipv4.operation == 0)
+            inside = IP_TYPE_V4;
+        else if  (src->header.ipv4.operation == 1)
+            inside = IP_TYPE_V6;
+    }
+    else if  (outside == IP_TYPE_V6){
+        if  (src->header.ipv6.optlen == IPV6_HEADER_OPTION_IPV4_LEN)
+            inside = IP_TYPE_V4;
+        else if  (src->header.ipv6.optlen == IPV6_HEADER_OPTION_IPV6_LEN)
+            inside = IP_TYPE_V6;
+    }
+
+    memset(dst, 0, sizeof(*dst));
+    dst->sport = src->sport;
+    dst->dport = src->dport;
+
+    if  (inside == IP_TYPE_V4){
+        dst->ip_type = IP_TYPE_V4;
+        memcpy(&dst->addrs, &src->addrs, sizeof(dst->addrs.ipv4));
+
+        return IP_OPTION_IPV4_LEN;
+    }
+    else if  (inside == 1){
+        dst->ip_type = IP_TYPE_V6;
+        memcpy(&dst->addrs, &src->addrs, sizeof(dst->addrs.ipv6));
+
+        return IP_OPTION_IPV6_LEN;
+    }
+
+    return -1;
+}
+
+
+struct ip_option_v2 {
+    union{
+        struct{
+            __u8 type;
+            __u8 length;
+            __u8 operation;
+            __u8 padding;
+        }ipv4;
+        struct{
+            __u8 nexthdr;
+            __u8 hdrlen;
+            __u8 option;
+            __u8 optlen;
+        }ipv6;
+    }header;
+
+    __be32 svni;
+    __be16 sport;
+    __be16 _pad0;
+
+    union {
+        unsigned char saddr4[4];
+        unsigned char saddr6[20]; /* extra 4 bytes padding */
+    };
+};
+
+
+#define IPV4_OPTION_V2_TYPE 29
+#define IPV6_HEADER_V2_OPTION 29
+
+#define IP_OPTION_V2_IPV4_LEN  16
+/* IP_OPTION_IPV6_LEN > sizeof(struct four_tuple_with_vni)
+ * because there's a padding field in IP Option
+ */
+#define IP_OPTION_V2_IPV6_LEN  32
+
+#define IPV6_HEADER_V2_IPV4_LEN ((IP_OPTION_V2_IPV4_LEN) / 8 - 1)
+#define IPV6_HEADER_V2_IPV6_LEN ((IP_OPTION_V2_IPV6_LEN) / 8 - 1)
+#define IPV6_HEADER_V2_OPTION_IPV4_LEN (IP_OPTION_V2_IPV4_LEN - 4)
+#define IPV6_HEADER_V2_OPTION_IPV6_LEN (IP_OPTION_V2_IPV6_LEN - 4)
+
+
+
+static int ip_option_v2_to_toa_map_value(enum IP_TYPE outside, struct ip_option_v2* src, struct toa_map_value* dst)
+{
+    int inside = -1;
+
+    // if  (outside == 0){
+    //     inside = src->header.ipv4.operation;
+    // }
+    // else if  (outside == 1){
+    //     if  (src->header.ipv6.optlen == IPV6_HEADER_V2_OPTION_IPV4_LEN)
+    //         inside = 0;
+    //     else if  (src->header.ipv6.optlen == IPV6_HEADER_V2_OPTION_IPV6_LEN)
+    //         inside = 1;
+    // }
+    if  (outside == IP_TYPE_V4){
+        if  (src->header.ipv4.operation == 0)
+            inside = IP_TYPE_V4;
+        else if  (src->header.ipv4.operation == 1)
+            inside = IP_TYPE_V6;
+    }
+    else if  (outside == IP_TYPE_V6){
+        if  (src->header.ipv6.optlen == IPV6_HEADER_V2_OPTION_IPV4_LEN)
+            inside = IP_TYPE_V4;
+        else if  (src->header.ipv6.optlen == IPV6_HEADER_V2_OPTION_IPV6_LEN)
+            inside = IP_TYPE_V6;
+    }
+
+    if  (inside == IP_TYPE_V4){
+        // dst->type = 0;
+        dst->four_tuple.ip_type = IP_TYPE_V4;
+        
+        dst->svni = src->svni;
+
+        // dst->sport = src->sport;
+        // dst->dport = 0;
+        dst->four_tuple.sport = src->sport;
+        dst->four_tuple.dport = 0;
+
+        // memcpy(&dst->addrs.ipv4.saddr, src->saddr4, sizeof(dst->addrs.ipv4.saddr));
+        // memset(&dst->addrs.ipv4.daddr, 0, sizeof(dst->addrs.ipv4.daddr));
+        memcpy(&dst->four_tuple.addrs.ipv4.saddr, src->saddr4, sizeof(dst->four_tuple.addrs.ipv4.saddr));
+        memset(&dst->four_tuple.addrs.ipv4.daddr, 0, sizeof(dst->four_tuple.addrs.ipv4.daddr));
+
+        return IP_OPTION_V2_IPV4_LEN;
+    }
+    else if  (inside == IP_TYPE_V6){
+        // dst->type = 1;
+        dst->four_tuple.ip_type = IP_TYPE_V6;
+
+        dst->svni = src->svni;
+        
+        // dst->sport = src->sport;
+        // dst->dport = 0;
+        dst->four_tuple.sport = src->sport;
+        dst->four_tuple.dport = 0;
+        
+        // memcpy(&dst->addrs.ipv6.saddr, src->saddr6, sizeof(dst->addrs.ipv6.saddr));
+        // memset(&dst->addrs.ipv6.daddr, 0, sizeof(dst->addrs.ipv6.daddr));
+        memcpy(&dst->four_tuple.addrs.ipv6.saddr, src->saddr6, sizeof(dst->four_tuple.addrs.ipv6.saddr));
+        memset(&dst->four_tuple.addrs.ipv6.daddr, 0, sizeof(dst->four_tuple.addrs.ipv6.daddr));
+
+        return IP_OPTION_V2_IPV6_LEN;
+    }
+
+    return -1;
+}
+
+
+
+// linux-5.4.56-bm  has introduced this content.
+
+#define TCPOPT_TOA__         254
+
+
+/* MUST be 4n !!!! */
+#define TCPOLEN_TOA_IP4__        8        /* |opcode|size|ip+port| = 1 + 1 + 6 */
+#define TCPOLEN_TOA_IP4_EXTRA__ 16        /* 1 + 1 + 6 + 2 + 6 */
+#define TCPOLEN_TOA_IP6__       20        /* |opcode|size|ip_of_v6+port| = 1 + 1 + 18 */
+
+/* MUST be 4 bytes alignment */
+struct toa_ip4_data__ {
+    __u8 opcode;
+    __u8 opsize;
+    __u16 port;
+    __u32 ip;
+};
+
+struct toa_ip4_extra_data__ {
+    struct toa_ip4_data__ legacy_data;
+    __u8  padding[2];
+    __u16 dst_port;
+    __u32 dst_ip;
+};
+
+struct  toa_ip6_data__ {
+    __u8 opcode;
+    __u8 opsize;
+    __u16 port;
+    struct in6_addr in6_addr;
+};
+
+
+static struct toa_map_entry* toa_parse_tcp_option(struct sk_buff* skb, enum IP_TYPE ip_type, void* iph, struct tcphdr* tcph)
+{
+    const unsigned char *ptr= (const unsigned char *)(tcph + 1);
+    int length = (tcph->doff * 4) - sizeof(struct tcphdr);
+    const char* start = NULL;
+    struct toa_map_entry* entry = NULL;
+
+
+    while (length > 0) {
+        int opcode = *ptr++;
+        int opsize;
+
+        switch (opcode) {
+        case TCPOPT_EOL:
+            return NULL;
+        case TCPOPT_NOP:    /* Ref: RFC 793 section 3.1 */
+            length--;
+            continue;
+        default:
+            if (length < 2)
+                return NULL;
+            opsize = *ptr++;
+            if (opsize < 2) /* "silly options" */
+                return NULL;
+            if (opsize > length)
+                return NULL;    /* don't parse partial options */
+            
+            switch (opcode) {
+
+            case TCPOPT_TOA__:
+                start = ptr - 2;
+                
+                pr_debug("toa_parse_tcp_option: opcode: %d, opsize: %d\n", opcode, opsize);
+                tcp_ip_display("toa_parse_tcp_option:        outside: ", ip_type, iph, tcph);
+                if  (ip_type == IP_TYPE_V4)
+                    toa_stats_inc(STATS_TCPV4_OPTION);
+                else if  (ip_type == IP_TYPE_V6)
+                    toa_stats_inc(STATS_TCPV6_OPTION);
+
+                if  (opsize == TCPOLEN_TOA_IP4__ || opsize == TCPOLEN_TOA_IP4_EXTRA__)
+                {
+                    struct toa_ip4_extra_data__* option = (struct toa_ip4_extra_data__*)start;
+                    
+
+                    entry = kmem_cache_alloc(toa_map_cache, GFP_ATOMIC);
+                    if  (!entry)
+                    {   pr_warn("can not alloc entry\n");
+                        return NULL;
+                    }
+                    memset(entry, 0, sizeof(*entry));
+                    entry->value.four_tuple.ip_type = IP_TYPE_V4;
+
+                    entry->value.four_tuple.sport = option->legacy_data.port;
+                    *(unsigned*)entry->value.four_tuple.addrs.ipv4.saddr = option->legacy_data.ip;
+
+                    if  (opsize == TCPOLEN_TOA_IP4_EXTRA__)
+                    {   entry->value.four_tuple.dport = option->dst_port;
+                        *(unsigned*)entry->value.four_tuple.addrs.ipv4.daddr = option->dst_ip;
+                        // pr_debug("toa_parse_tcp_option: opt: %pI4:%d, value: %pI4:%d",
+                        //         &option->dst_ip, ntohs(option->dst_port),
+                        //         entry->value.addrs.ipv4.daddr, ntohs(entry->value.dport));
+                    }
+
+                }
+                else if  (opsize == TCPOLEN_TOA_IP6__)
+                {
+                    struct toa_ip6_data__* option = (struct toa_ip6_data__*)start;
+
+                    entry = kmem_cache_alloc(toa_map_cache, GFP_ATOMIC);
+                    if  (!entry)
+                    {   pr_warn("can not alloc entry\n");
+                        return NULL;
+                    }
+                    memset(entry, 0, sizeof(*entry));
+
+                    // entry->value.four_tuple.type = 1; // ipv6
+                    entry->value.four_tuple.ip_type = IP_TYPE_V6;
+                    entry->value.four_tuple.sport = option->port;
+                    memcpy(entry->value.four_tuple.addrs.ipv6.saddr, &option->in6_addr, 16);
+
+                }
+                else
+                    pr_warn("get toa option with illegal length: %d\n", opsize);
+
+                return entry;
+            }
+            ptr += opsize-2;
+            length -= opsize;
+        }
+    }
+
+    return NULL;
+}
+
+
+static int toa_process_v4(struct sock* newsock, struct sk_buff* skb)
+{
+    struct iphdr* iph = ip_hdr(skb);
+    struct tcphdr* tcph = tcp_hdr(skb);
+    struct toa_map_entry* entry = NULL;
+    
+    // try to parse option to get entry
+    if  (iph->ihl > 5 && iph->protocol == IPPROTO_TCP)
+    {
+        struct ip_option* ipopt = (struct ip_option*)(iph + 1);
+        struct ip_option_v2* ipopt2 = (struct ip_option_v2*)(iph + 1);
+
+        if (ipopt->header.ipv4.type == IPV4_OPTION_TYPE
+            || ipopt->header.ipv4.type == IPV4_OPTION_ASYM_TYPE)
+        {
+            toa_stats_inc(STATS_IPV4_OPTION);
+            tcp_ip_display("toa_process_v4: get ip_opt,  outside: ", IP_TYPE_V4, iph, tcph);
+
+            entry = kmem_cache_alloc(toa_map_cache, GFP_ATOMIC);
+            if  (!entry)
+            {   pr_warn("can not alloc entry\n");
+                return -1;
+            }
+
+            ip_option_to_four_tuple(IP_TYPE_V4, ipopt, &entry->value.four_tuple);
+            entry->value.svni = 0;
+
+        }
+        else if  (ipopt2->header.ipv4.type == IPV4_OPTION_V2_TYPE)
+        {
+            toa_stats_inc(STATS_IPV4_OPTION_V2);
+            tcp_ip_display("toa_process_v4: get ip_opt2, outside: ", IP_TYPE_V4, iph, tcph);
+
+            entry = kmem_cache_alloc(toa_map_cache, GFP_ATOMIC);
+            if  (!entry)
+            {   pr_warn("can not alloc entry\n");
+                return -1;
+            }
+
+            ip_option_v2_to_toa_map_value(IP_TYPE_V4, ipopt2, &entry->value);
+
+        }
+    }
+
+    if  (entry == NULL && tcph->doff > 5)
+    {
+        entry = toa_parse_tcp_option(skb, IP_TYPE_V4, iph, tcph);
+    }
+
+    // already get entry then insert to map
+    if  (entry)
+    {
+        // four_tuple_display("toa_process_v4: get value,    inside: ", &entry->value.four_tuple);
+        toa_map_value_display("toa_process_v4: get value,    inside: ", &entry->value);
+
+        entry->sk = newsock;
+        newsock->sk_destruct = tcp_sk_destruct_toa;
+
+        toa_map_insert(entry);
+        toa_stats_inc(STATS_V4_SAVED);
+    }
+
+    return 0;
+}
+
+
+
+static int toa_process_v6(struct sock* newsock, struct sk_buff* skb)
+{
+    struct ipv6hdr *ip6h = ipv6_hdr(skb);
+    struct tcphdr* tcph = tcp_hdr(skb);
+    struct toa_map_entry* entry = NULL;
+
+    // try to parse option to get entry
+    if  (ip6h->nexthdr == IPPROTO_DSTOPTS
+        && ((struct ip_option*)(ip6h +1))->header.ipv6.nexthdr == IPPROTO_TCP)
+    {
+        struct ip_option* ipopt = (struct ip_option*)(ip6h + 1);
+        struct ip_option_v2* ipopt2 = (struct ip_option_v2*)(ip6h + 1);
+
+        if  (ipopt->header.ipv6.option == IPV6_HEADER_OPTION
+            || ipopt->header.ipv6.option == IPV6_HEADER_ASYM_OPTION)
+        {
+
+            toa_stats_inc(STATS_IPV6_OPTION);
+            tcp_ip_display("toa_process_v6: get ip_opt,  outside: ", IP_TYPE_V6, ip6h, tcph);
+
+            entry = kmem_cache_alloc(toa_map_cache, GFP_ATOMIC);
+            if  (!entry)
+            {   pr_warn("can not alloc entry\n");
+                return -1;
+            }
+
+            ip_option_to_four_tuple(IP_TYPE_V6, ipopt, &entry->value.four_tuple);
+            entry->value.svni = 0;
+        }
+        else if  (ipopt2->header.ipv6.option == IPV6_HEADER_V2_OPTION)
+        {
+            toa_stats_inc(STATS_IPV6_OPTION_V2);
+            tcp_ip_display("toa_process_v6: get ip_opt2, outside: ", IP_TYPE_V6, ip6h, tcph);
+
+            entry = kmem_cache_alloc(toa_map_cache, GFP_ATOMIC);
+            if  (!entry)
+            {   pr_warn("can not alloc entry\n");
+                return -1;
+            }
+
+            ip_option_v2_to_toa_map_value(IP_TYPE_V6, ipopt2, &entry->value);
+        }
+    }
+
+    if  (entry == NULL && tcph->doff > 5)
+    {
+        entry = toa_parse_tcp_option(skb, IP_TYPE_V6, ip6h, tcph);            
+    }
+
+    // already get entry then insert to map
+    if  (entry)
+    {
+        // four_tuple_display("toa_process_v6: get value,    inside: ", &entry->value.four_tuple);
+        toa_map_value_display("toa_process_v6: get value,    inside: ", &entry->value);
+
+        entry->sk = newsock;        
+        newsock->sk_destruct = tcp_sk_destruct_toa;
+        toa_map_insert(entry);
+        toa_stats_inc(STATS_V6_SAVED);
+    }
+    return 0;
+}
+
+
+#ifdef TOA_USE_MULTI_HOOK
+
+
+// static struct sock* tcp_v4_syn_recv_sock_toa(const struct sock *sk, struct sk_buff *skb,
+//         struct request_sock *req, struct dst_entry *dst, struct request_sock *req_unhash, bool *own_req)
+static void tcp_v4_syn_recv_sock_toa_in_multi_hook(struct hook_pt_regs* ctx)
+{
+    struct sock* sk = (struct sock*)ctx->args[0];
+    struct sk_buff* skb = (struct sk_buff*)ctx->args[1];
+    struct sock* new_sk = (struct sock*)ctx->ret;
+
+    pr_debug("tcp_v4_syn_recv_sock_toa_in_multi_hook, sk: %lx, skb: %lx, ret: %lx\n", 
+            (unsigned long)sk, (unsigned long)skb, (unsigned long)new_sk);
+    if  (!new_sk)
+        return;
+
+    toa_process_v4(new_sk, skb);
+}
+
+
+static void tcp_v6_syn_recv_sock_toa_in_multi_hook(struct hook_pt_regs* ctx)
+{
+    struct sock* sk = (struct sock*)ctx->args[0];
+    struct sk_buff* skb = (struct sk_buff*)ctx->args[1];
+    struct sock* new_sk = (struct sock*)ctx->ret;
+
+    pr_debug("tcp_v6_syn_recv_sock_toa_in_multi_hook, sk: %lx, skb: %lx, ret: %lx\n", 
+            (unsigned long)sk, (unsigned long)skb, (unsigned long)new_sk);
+    if  (!new_sk)
+        return;
+
+    toa_process_v6(new_sk, skb);
+
+}
+
+#else
+typedef struct sock* (*syn_recv_sock_t)(const struct sock *sk, struct sk_buff *skb,
+        struct request_sock *req, struct dst_entry *dst, struct request_sock *req_unhash, bool *own_req);
+
+syn_recv_sock_t tcp_v4_syn_recv_sock_prev;
+syn_recv_sock_t tcp_v6_syn_recv_sock_prev;
+
+
+static struct sock* tcp_v4_syn_recv_sock_toa(const struct sock *sk, struct sk_buff *skb,
+        struct request_sock *req, struct dst_entry *dst, struct request_sock *req_unhash, bool *own_req)
+{
+    struct sock* newsock = tcp_v4_syn_recv_sock_prev(sk, skb, req, dst, req_unhash, own_req);
+    if  (!newsock)  return newsock;
+    toa_stats_inc(STATS_V4_ESTABLISH);
+
+    toa_process_v4(newsock, skb);
+
+    return newsock;
+}
+
+
+static struct sock *tcp_v6_syn_recv_sock_toa(const struct sock *sk, struct sk_buff *skb,
+        struct request_sock *req, struct dst_entry *dst, struct request_sock *req_unhash, bool *own_req)
+{    
+    struct sock*  newsock = tcp_v6_syn_recv_sock_prev(sk, skb, req, dst, req_unhash, own_req);
+    if  (!newsock)  return newsock;
+    toa_stats_inc(STATS_V6_ESTABLISH);
+
+    toa_process_v6(newsock, skb);
+
+    return newsock;
+}
+#endif
+
+
+// toa hook init -----------------------------------------------------------------------
+
+
+static unsigned long syn_recv_sock_v4_p = 0;
+static unsigned long syn_recv_sock_v6_p = 0;
+static unsigned long inet_getname_v4_p = 0;
+static unsigned long inet_getname_v6_p = 0;
+
+
+static int toa_hook_init_addr(void)
+{
+    struct inet_connection_sock_af_ops* ipv4_specific_p;
+    struct inet_connection_sock_af_ops* ipv6_specific_p;
+    struct proto_ops* inet_stream_ops_p;
+    struct proto_ops* inet6_stream_ops_p;
+
+     
+    ipv4_specific_p = (struct inet_connection_sock_af_ops *)kallsyms_lookup_name("ipv4_specific");
+    if (!ipv4_specific_p) {
+        pr_warn("not found ipv4_specific");
+        return -1;
+    }
+
+    ipv6_specific_p = (struct inet_connection_sock_af_ops *)kallsyms_lookup_name("ipv6_specific");
+    if  (!ipv6_specific_p)
+    {   pr_warn("not found ipv6_specific");
+        return -1;
+    }
+
+    inet_stream_ops_p = (struct proto_ops*)kallsyms_lookup_name("inet_stream_ops");
+    if  (!inet_stream_ops_p)
+    {   pr_warn("not found inet_stream_ops");
+        return -1;
+    }
+
+    inet6_stream_ops_p = (struct proto_ops*)kallsyms_lookup_name("inet6_stream_ops");
+    if  (!inet6_stream_ops_p)
+    {   pr_warn("not found inet6_stream_ops");
+        return -1;
+    }
+
+
+    syn_recv_sock_v4_p = (unsigned long)&ipv4_specific_p->syn_recv_sock;
+    syn_recv_sock_v6_p = (unsigned long)&ipv6_specific_p->syn_recv_sock;
+
+    inet_getname_v4_p = (unsigned long)&inet_stream_ops_p->getname;
+    inet_getname_v6_p = (unsigned long)&inet6_stream_ops_p->getname;
+
+    return 0;
+}
+
+
+#ifdef TOA_USE_MULTI_HOOK
+
+struct hook_ctx_t* syn_recv_sock_v4_hook_ctx = NULL;
+struct hook_ctx_t* syn_recv_sock_v6_hook_ctx = NULL;
+struct hook_ctx_t* inet_getname_v4_hook_ctx = NULL;
+struct hook_ctx_t* inet_getname_v6_hook_ctx = NULL;
+
+static int toa_hook_init_with_multi_hook(void)
+{
+    int ret = -1;
+
+    syn_recv_sock_v4_hook_ctx = multi_hook_manager_get(syn_recv_sock_v4_p, "syn_recv_sock_v4 inited by toa");
+    if  (!syn_recv_sock_v4_hook_ctx)
+    {   pr_warn("syn_recv_sock_v4_hook_ctx init failed\n");
+        goto err_syn_recv_sock_v4_hook_ctx;
+    }
+
+    ret = hook_ctx_register_func(syn_recv_sock_v4_hook_ctx, 1, 1, (unsigned long)tcp_v4_syn_recv_sock_toa_in_multi_hook, 1);
+    if  (ret < 0)
+    {   pr_warn("tcp_v4_syn_recv_sock_toa init failed\n");
+        goto err_syn_recv_sock_v4_func;
+    }
+
+    syn_recv_sock_v6_hook_ctx = multi_hook_manager_get(syn_recv_sock_v6_p, "syn_recv_sock_v6 inited by toa");
+    if  (!syn_recv_sock_v6_hook_ctx)
+    {   pr_warn("syn_recv_sock_v6_hook_ctx init failed\n");
+        goto err_syn_recv_sock_v6_hook_ctx;
+    }
+
+    ret = hook_ctx_register_func(syn_recv_sock_v6_hook_ctx, 1, 1, (unsigned long)tcp_v6_syn_recv_sock_toa_in_multi_hook, 1);
+    if  (ret < 0)
+    {   pr_warn("tcp_v6_syn_recv_sock_toa init failed\n");
+        goto err_syn_recv_sock_v6_func;
+    }
+
+
+    // inet_getname_prev = (inet_getname_t)*(unsigned long*)inet_getname_v4_p;
+    // pr_debug("inet_getname_prev: %lx\n", (unsigned long)inet_getname_prev);
+
+    inet_getname_v4_hook_ctx = multi_hook_manager_get(inet_getname_v4_p, "inet_getname_v4 inited by toa");
+    if  (!inet_getname_v4_hook_ctx)
+    {   pr_warn("inet_getname_v4_hook_ctx init failed\n");
+        goto err_inet_getname_v4_hook_ctx;
+    }
+
+    ret = hook_ctx_get_original_func(inet_getname_v4_hook_ctx, (unsigned long*)&inet_getname_prev);
+    if  (ret < 0)
+    {   pr_warn("get inet_getname_prev failed\n");
+        goto err_inet_getname_v4_hook_ctx;
+    }
+    pr_debug("inet_getname_prev: %lx\n", (unsigned long)inet_getname_prev);
+
+    ret = hook_ctx_register_func(inet_getname_v4_hook_ctx, 0, 5, (unsigned long)inet_getname_toa, 0);
+    if  (ret < 0)
+    {   pr_warn("inet_getname_toa hook failed\n");
+        goto err_inet_getname_v4_func;
+    }
+    
+
+    // inet6_getname_prev = (inet_getname_t)*(unsigned long*)inet_getname_v6_p;
+    // pr_debug("inet6_getname_prev: %lx\n", (unsigned long)inet6_getname_prev);
+
+    inet_getname_v6_hook_ctx = multi_hook_manager_get(inet_getname_v6_p, "inet_getname_v6 inited by toa");
+    if  (!inet_getname_v6_hook_ctx)
+    {   pr_warn("inet_getname_v6_hook_ctx init failed\n");
+        goto err_inet_getname_v6_hook_ctx;
+    }
+
+    ret = hook_ctx_get_original_func(inet_getname_v6_hook_ctx, (unsigned long*)&inet6_getname_prev);
+    if  (ret < 0)
+    {   pr_warn("get inet6_getname_prev failed\n");
+        goto err_inet_getname_v6_hook_ctx;
+    }
+    pr_debug("inet6_getname_prev: %lx\n", (unsigned long)inet6_getname_prev);
+
+    ret = hook_ctx_register_func(inet_getname_v6_hook_ctx, 0, 5, (unsigned long)inet6_getname_toa, 0);
+    if  (ret < 0)
+    {   pr_warn("inet6_getname_toa hook failed\n");
+        goto err_inet_getname_v6_func;
+    }
+
+    return 0;    
+
+err_inet_getname_v6_func:
+    multi_hook_manager_put(inet_getname_v6_p);
+err_inet_getname_v6_hook_ctx:
+    hook_ctx_unregister_func(inet_getname_v4_hook_ctx, 0, 5);
+err_inet_getname_v4_func:
+    multi_hook_manager_put(inet_getname_v4_p);
+err_inet_getname_v4_hook_ctx:
+    hook_ctx_unregister_func(syn_recv_sock_v6_hook_ctx, 1, 1);
+err_syn_recv_sock_v6_func:
+    multi_hook_manager_put(syn_recv_sock_v6_p);
+err_syn_recv_sock_v6_hook_ctx:
+    hook_ctx_unregister_func(syn_recv_sock_v4_hook_ctx, 1, 1);
+err_syn_recv_sock_v4_func:
+    multi_hook_manager_put(syn_recv_sock_v4_p);
+err_syn_recv_sock_v4_hook_ctx:
+
+    return -1;
+}
+
+static int toa_hook_init(void)
+{
+    if  (toa_hook_init_addr() < 0)
+        return -1;
+
+    if  (toa_hook_init_with_multi_hook() < 0)
+        return -1;
+
+    return 0;
+}
+
+static void toa_hook_exit_with_multi_hook(void)
+{
+    hook_ctx_unregister_func(syn_recv_sock_v4_hook_ctx, 1, 1);
+    multi_hook_manager_put(syn_recv_sock_v4_p);
+
+    hook_ctx_unregister_func(syn_recv_sock_v6_hook_ctx, 1, 1);
+    multi_hook_manager_put(syn_recv_sock_v6_p);
+    
+    hook_ctx_unregister_func(inet_getname_v4_hook_ctx, 0, 5);
+    multi_hook_manager_put(inet_getname_v4_p);
+
+    hook_ctx_unregister_func(inet_getname_v6_hook_ctx, 0, 5);
+    multi_hook_manager_put(inet_getname_v6_p);
+}
+
+static void toa_hook_exit(void)
+{
+    toa_hook_exit_with_multi_hook();
+}
+
+
+#else
+
+
+static int toa_hook_func(unsigned long target, unsigned long new, unsigned long* prev_p)
+{
+    unsigned long prev;
+    pte_t* pte_p;
+    int level;
+    struct page* page;
+    void* start = NULL;
+    unsigned long* target1 = NULL;
+
+
+    pte_p = lookup_address(target, &level);
+    if  (!pte_p)
+        return 0;
+
+    if  (level == PG_LEVEL_4K)
+    {   pr_debug("%s: PG_LEVEL_4K\n", __func__);
+        page = pte_page(*pte_p);
+    }
+    else if  (level == PG_LEVEL_2M)
+    {
+        pr_debug("%s: PG_LEVEL_2M\n", __func__);
+        page = pmd_page(*((pmd_t *)pte_p));
+        page += pte_index(target);
+    }
+    else 
+    {   pr_debug("%s: pte_p: %d\n", __func__, level);
+        return 0;
+    }
+        
+    start = vmap(&page, 1, VM_MAP, PAGE_KERNEL);
+    if  (!start)
+        return -EPERM;
+    
+    target1 = (unsigned long*)((unsigned long)start | ((unsigned long)target & (PAGE_SIZE - 1)));
+
+    prev = xchg(target1, new);
+
+    if  (prev_p) *prev_p = prev;
+
+
+    vunmap(start);
+
+    return 0;
+}
+
+static int toa_hook_init_native(void)
+{
+    pr_debug("%s: tcp_v4_syn_rcv_sock_toa: %lx\n", __func__, (unsigned long)tcp_v4_syn_recv_sock_toa);
+    pr_debug("%s: tcp_v4_syn_rcv_sock_prev: %lx\n", __func__, *(unsigned long*)syn_recv_sock_v4_p);
+    toa_hook_func(syn_recv_sock_v4_p, (unsigned long)tcp_v4_syn_recv_sock_toa, 
+            (unsigned long*)&tcp_v4_syn_recv_sock_prev);
+    pr_debug("%s: tcp_v4_syn_recv_sock_now: %lx\n", __func__, *(volatile unsigned long*)syn_recv_sock_v4_p);
+    pr_debug("%s: tcp_v4_syn_recv_sock_ret: %lx\n", __func__, (unsigned long)tcp_v4_syn_recv_sock_prev);
+
+    pr_debug("%s: tcp_v6_syn_rcv_sock_toa: %lx\n", __func__, (unsigned long)tcp_v6_syn_recv_sock_toa);
+    pr_debug("%s: tcp_v6_syn_rcv_sock_prev: %lx\n", __func__, *(unsigned long*)syn_recv_sock_v6_p);
+    toa_hook_func(syn_recv_sock_v6_p, (unsigned long)tcp_v6_syn_recv_sock_toa, 
+            (unsigned long*)&tcp_v6_syn_recv_sock_prev);
+    pr_debug("%s: tcp_v6_syn_recv_sock_now: %lx\n", __func__, *(volatile unsigned long*)syn_recv_sock_v6_p);
+    pr_debug("%s: tcp_v6_syn_recv_sock_ret: %lx\n", __func__, (unsigned long)tcp_v6_syn_recv_sock_prev);
+    
+
+    toa_hook_func(inet_getname_v4_p, (unsigned long)inet_getname_toa, 
+            (unsigned long*)&inet_getname_prev);
+
+    toa_hook_func(inet_getname_v6_p, (unsigned long)inet6_getname_toa, 
+            (unsigned long*)&inet6_getname_prev);
+
+    return 0;
+}
+
+static int toa_hook_init(void)
+{
+    if  (toa_hook_init_addr() < 0)
+        return -1;
+
+    if  (toa_hook_init_native() < 0)
+        return -1;
+
+    return 0;
+}
+
+static void toa_hook_exit_native(void)
+{
+    toa_hook_func(syn_recv_sock_v4_p, (unsigned long)tcp_v4_syn_recv_sock_prev, NULL);
+
+    toa_hook_func(syn_recv_sock_v6_p, (unsigned long)tcp_v6_syn_recv_sock_prev, NULL);
+
+    toa_hook_func(inet_getname_v4_p, (unsigned long)inet_getname_prev, NULL);
+
+    toa_hook_func(inet_getname_v6_p, (unsigned long)inet6_getname_prev, NULL);
+}
+
+static void toa_hook_exit(void)
+{
+    toa_hook_exit_native();
+}
+
+#endif
+
+
+
+// toa_init --------------------------------------------------------------------------------------------------
 
 static int __init toa_init(void)
 {
-	pr_debug("%s: 1", __func__);
+    pr_info("toa_init begin, version %s\n", TOA_VERSION);
+    if  (v6_to_v4_prefix_str == NULL) v6_to_v4_prefix_str = v6_to_v4_prefix_str_default;
+    
+    if  (in6_pton(v6_to_v4_prefix_str, -1, v6_to_v4_prefix_addr, '\0', NULL) <= 0)
+    {   pr_warn("bad v6_to_v4_prefix_str %s\n", v6_to_v4_prefix_str);
+        goto addr_err;
+    }
+        
+    pr_info("toa init with toa_map_table_bits = %d, vip_enable = %d, v6_to_v4_enable = %d, v6_to_v4_prefix_addr = %pI6\n", 
+            toa_map_table_bits, vip_enable, v6_to_v4_enable, v6_to_v4_prefix_addr);
+    
 
-	pr_info("toa inserted\n");
-	return 0;
+    sk_data_ready_addr = kallsyms_lookup_name("sock_def_readable");
+    pr_info("%s: CPU[%u]: sk_data_ready_addr = kallsyms_lookup_name(sock_def_readable) = %lx\n",
+            __func__, smp_processor_id(), sk_data_ready_addr);
+    if  (sk_data_ready_addr == 0)
+    {   pr_warn("%s: cannnot find sock_def_readable.\n", __func__);
+        goto addr_err;
+    }
+    
+    if  (toa_stats_init() != 0)
+    {   pr_warn("toa_stats_init error\n");
+        goto stats_err;
+    }
+        
+    if  (toa_map_init() != 0)
+    {   pr_warn("toa_map_init error\n");
+        goto map_err;
+    }
+
+    if  (toa_sockopt_init() != 0)
+    {   pr_warn("toa_sockopt_init error\n");
+        goto sockopt_err;
+    }
+        
+    if  (toa_hook_init() != 0)
+    {   pr_warn("toa_hook_init error\n");
+        goto hook_err;
+    }
+
+    pr_info("toa_init end, inserted\n");
+    return 0;
+
+hook_err:
+    toa_sockopt_exit();
+sockopt_err:
+    toa_map_exit();
+map_err:
+    toa_stats_exit();
+stats_err:
+addr_err:
+    pr_warn("toa_init end , failed\n");
+    return -1;
 }
 
 static void __exit toa_exit(void)
 {
-	pr_info("toa rmeoved\n");
-	pr_debug("---------------------------------------------");
+    pr_info("toa_exit begin, version %s\n", TOA_VERSION);
+
+    toa_hook_exit();
+    // the hooked function should protected by rcu, 
+    // as in production environment we do not enable preemption, 
+    // the rcu_read_lock and rcu_assign_pointere is not necessary, which should also be given attention.
+    synchronize_rcu();
+
+    toa_sockopt_exit();
+
+    toa_map_exit();
+    // to compact with toa-mptcp
+    synchronize_rcu();
+
+    vfree(toa_map_table);
+
+
+    toa_stats_exit();
+
+    pr_info("toa_exit end, rmeoved\n");
+    pr_debug("---------------------------------------------\n");
 }
+
 
 module_init(toa_init);
 module_exit(toa_exit);
 MODULE_LICENSE("GPL");
+MODULE_VERSION(TOA_VERSION);
+MODULE_AUTHOR("Qianyu Zhang <zhangianyu.sys@bytedance.com>");
+
