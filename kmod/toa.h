@@ -10,5 +10,17 @@ enum {
     TOA_SO_GET_VNI       = TOA_SO_BASE,
     TOA_SO_GET_MAX       = TOA_SO_GET_VNI,
 };
+enum {
+    TOA_BASE_CTL            = 4096,
+    /* set */
+    TOA_SO_SET_MAX_CTL          = TOA_BASE_CTL,
+    /* get */
+    TOA_SO_GET_LOOKUP       = TOA_BASE_CTL,
+    TOA_SO_GET_MAX_CTL          = TOA_SO_GET_LOOKUP,
+};
 
+struct toa_nat64_peer {
+    struct in6_addr saddr;
+    uint16_t sport;
+};
 #endif

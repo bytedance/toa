@@ -4,7 +4,7 @@
 
 
 PACKAGE_NAME="toa-dkms"
-PACKAGE_VERSION="3.1.0"
+PACKAGE_VERSION="3.2.0-opensource"
 
 
 POJ_DIR=..

@@ -43,8 +43,8 @@
 
 //  toa stats ------------------------------------
 
-// const char toa_version[] = "3.1.0";
-#define TOA_VERSION "3.1.0"
+// const char toa_version[] = "3.2.0-opensource";
+#define TOA_VERSION "3.2.0-opensource"
 
 enum
 {
@@ -602,6 +602,7 @@ static int inet_getname_toa(struct socket *sock, struct sockaddr *uaddr,int peer
 
     retval = inet_getname_prev(sock, uaddr, peer);
     if  (retval < 0)  return retval;
+    if  (peer == 2)  return retval;// accept4 use peer == 2 to get peer name, return true peer name if peer == 2.
 
     if  (inet_getname_with_toa(sock, AF_INET, uaddr, &new_len, peer) == 0)
     {   retval = new_len;
@@ -619,7 +620,7 @@ static int inet6_getname_toa(struct socket *sock, struct sockaddr *uaddr, int pe
 
     retval = inet6_getname_prev(sock, uaddr, peer);
     if  (retval < 0)  return retval;
-
+    if  (peer == 2)  return retval;// accept4 use peer == 2 to get peer name, return true peer name if peer == 2.
 
     if  (inet_getname_with_toa(sock, AF_INET6, uaddr, &new_len, peer) == 0)
     {   retval = new_len;
@@ -646,6 +647,7 @@ static int inet_getname_toa(struct socket *sock, struct sockaddr *uaddr, int *ua
 
     retval = inet_getname_prev(sock, uaddr, uaddr_len, peer);
     if  (retval < 0)  return retval;
+    if  (peer == 2)  return retval;// accept4 use peer == 2 to get peer name, return true peer name if peer == 2.
 
     if  (inet_getname_with_toa(sock, AF_INET, uaddr, &new_len, peer) == 0)
     {   
@@ -664,6 +666,7 @@ static int inet6_getname_toa(struct socket *sock, struct sockaddr *uaddr, int *u
 
     retval = inet6_getname_prev(sock, uaddr, uaddr_len, peer);
     if  (retval < 0)  return retval;
+    if  (peer == 2)  return retval;// accept4 use peer == 2 to get peer name, return true peer name if peer == 2.
 
     if  (inet_getname_with_toa(sock, AF_INET6, uaddr, &new_len, peer) == 0)
     {   
@@ -689,7 +692,7 @@ static int toa_sockopt_get(struct sock *sk, int cmd, void __user *user, int *len
     // struct four_tuple_with_vni value;
     struct toa_map_value value;
     unsigned int vni = 0;
-    // pr_debug("toa_sockopt_get: cmd: %d", cmd);
+    pr_debug("toa_sockopt_get: cmd: %d", cmd);
 
     if (cmd == TOA_SO_GET_VNI)
     {   
@@ -710,9 +713,40 @@ static int toa_sockopt_get(struct sock *sk, int cmd, void __user *user, int *len
         toa_stats_inc(STATS_GET_VNI_SUCC);
         pr_debug("toa_sockopt_get: succ, vni: %u\n", vni);
         return 0;
-    }
-    else
-    {   pr_warn("toa_sockopt_get bad cmd: %d", cmd);
+    } else if (cmd == TOA_SO_GET_LOOKUP) {
+        struct toa_nat64_peer uaddr;
+        int found;
+
+        if (*len < sizeof(struct toa_nat64_peer) ||
+            NULL == user) {
+            pr_debug("%s: bad param len\n", __func__);
+            return -EINVAL;
+        }
+
+        found = toa_map_get1(sk, &value);
+
+        if  (found) {
+            four_tuple_display("TOA_SO_GET_LOOKUP:  ", &value.four_tuple);
+            if (IP_TYPE_V4 == value.four_tuple.ip_type) {
+                pr_debug("TOA_SO_GET_LOOKUP only support ipv6 output\n");
+                return -EFAULT;
+            }
+            memcpy(&uaddr.saddr, &value.four_tuple.addrs.ipv6.saddr, sizeof(uaddr.saddr ));
+            uaddr.sport  = value.four_tuple.sport;
+
+            if (copy_to_user(user, &uaddr, sizeof(struct toa_nat64_peer)) != 0) {
+                return -EFAULT;
+            }
+
+            *len = sizeof(struct toa_nat64_peer);
+        } else {
+            pr_debug("toa_sockopt_get: failed\n");
+            return -EFAULT;
+        }
+        pr_debug("toa_sockopt_get: succ\n");
+        return 0;
+    } else {
+        pr_warn("toa_sockopt_get bad cmd: %d", cmd);
         return -EINVAL;
     }
 
@@ -732,7 +766,18 @@ static struct nf_sockopt_ops toa_sockopts = {
     .get_optmax    = TOA_SO_GET_MAX + 1,
     .get        = toa_sockopt_get,
 };
-
+static struct nf_sockopt_ops toa_sockopts_nat64 = {
+    .pf          = PF_INET,
+    .owner        = THIS_MODULE,
+    /* set */
+    .set_optmin    = TOA_BASE_CTL,
+    .set_optmax    = TOA_SO_SET_MAX_CTL + 1,
+    .set        = toa_sockopt_set,
+    /* get */
+    .get_optmin    = TOA_BASE_CTL,
+    .get_optmax    = TOA_SO_GET_MAX_CTL + 1,
+    .get        = toa_sockopt_get,
+};
 static int toa_sockopt_init(void)
 {
     int err;
@@ -742,12 +787,19 @@ static int toa_sockopt_init(void)
         pr_warn("fail to register sockopt\n");
         return -ENOMEM;
     }
+    err = nf_register_sockopt(&toa_sockopts_nat64);
+    if (err != 0) {
+        pr_warn("fail to register sockopt\n");
+        nf_unregister_sockopt(&toa_sockopts);
+        return -ENOMEM;
+    }
     return 0;
 }
 
 static void toa_sockopt_exit(void)
 {
     nf_unregister_sockopt(&toa_sockopts);
+    nf_unregister_sockopt(&toa_sockopts_nat64);
 }
 
 

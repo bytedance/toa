@@ -8,7 +8,7 @@ echo "arg3: $3"
 
 # remove dkms
 PACKAGE_NAME="toa-dkms"
-PACKAGE_VERSION="3.1.0"
+PACKAGE_VERSION="3.2.0-opensource"
 
 case "$1" in
     remove|upgrade|deconfigure)

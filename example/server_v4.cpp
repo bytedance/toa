@@ -56,10 +56,10 @@ int main(int argc, char** argv)
     this_addr.sin_addr.s_addr = INADDR_ANY;
     bzero(&(this_addr.sin_zero), sizeof(this_addr.sin_zero));
 
+
     int port_;
     if  (sscanf(argv[1], "%d", &port_) == -1)  perror("bad port");
     this_addr.sin_port = htons((short)port_);
-
 
     int fd = -1;
     if ((fd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
